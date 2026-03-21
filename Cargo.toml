@@ -6,6 +6,16 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+miden-assembly-syntax = { path = "../miden-vm/crates/assembly-syntax" }
+miden-core = { path = "../miden-vm/core" }
+miden-mast-package = { path = "../miden-vm/crates/mast-package" }
+miden-package-registry = { path = "../miden-vm/crates/package-registry", features = ["resolver"] }
+miden-project = { path = "../miden-vm/crates/project" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.50", features = ["io-std", "macros", "rt-multi-thread", "sync"] }
+tower-lsp = "0.20.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tree-sitter = "0.26"
 tree-sitter-masm = "0.1"
-#miden-project = { path = "../miden-vm/crates/project" }
-#miden-mast-package = { path = "../miden-vm/crates/mast-package" }
