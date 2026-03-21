@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs,
     path::{Path as FsPath, PathBuf},
     sync::Arc,
@@ -7,7 +7,7 @@ use std::{
 
 use miden_assembly_syntax::{
     Path as MasmPath,
-    ast::ProcedureName,
+    ast::{Ident, ProcedureName},
     debuginfo::{DefaultSourceManager, SourceManagerExt},
 };
 use miden_core::serde::Deserializable;
@@ -23,12 +23,16 @@ use miden_project::{
 };
 use serde::Deserialize;
 use tower_lsp::lsp_types::{
-    Diagnostic, DiagnosticSeverity, DocumentSymbol, DocumentSymbolResponse, Hover, HoverContents,
-    Location, MarkupContent, MarkupKind, Position, Range, SymbolInformation, SymbolKind, Url,
+    CompletionItem, CompletionItemKind, CompletionTextEdit, Diagnostic, DiagnosticSeverity,
+    Documentation, DocumentSymbol, DocumentSymbolResponse, Hover, HoverContents, Location,
+    MarkupContent, MarkupKind, Position, PrepareRenameResponse, Range, SymbolInformation,
+    SymbolKind, TextEdit, Url, WorkspaceEdit,
 };
 use tree_sitter::{Node, Tree};
 
-use crate::document::{byte_range_to_lsp_range, compute_line_offsets, parse_text};
+use crate::document::{
+    byte_range_to_lsp_range, compute_line_offsets, parse_text, position_to_offset,
+};
 
 type OverlayMap = BTreeMap<PathBuf, String>;
 
@@ -150,6 +154,8 @@ struct Definition {
     symbol_kind: SymbolKind,
     hover: String,
     location: Option<DefinitionLocation>,
+    editable: bool,
+    renamable: bool,
     visible_outside_context: bool,
     selection_range: Range,
 }
@@ -227,6 +233,7 @@ struct ModuleAnalysis {
     file_path: PathBuf,
     module_path: String,
     priority: usize,
+    editable: bool,
     local_names: BTreeMap<String, String>,
     imports: BTreeMap<String, ImportAlias>,
     definitions: Vec<Definition>,
@@ -395,6 +402,361 @@ impl ProjectSnapshot {
 
         None
     }
+
+    pub fn references_at(
+        &self,
+        document_path: &FsPath,
+        position: Position,
+        include_declaration: bool,
+    ) -> Option<Vec<Location>> {
+        let symbol = self.symbol_at(document_path, position)?;
+        let target_identities = symbol
+            .definition_indexes
+            .iter()
+            .filter_map(|index| self.definitions.get(*index))
+            .map(definition_identity)
+            .collect::<BTreeSet<_>>();
+
+        let mut locations = Vec::new();
+        let mut seen = BTreeSet::new();
+
+        if include_declaration {
+            for definition in &self.definitions {
+                if target_identities.contains(&definition_identity(definition))
+                    && let Some(location) = definition.location()
+                {
+                    push_unique_location(&mut locations, &mut seen, location);
+                }
+            }
+        }
+
+        for modules in self.modules_by_file.values() {
+            for module in modules {
+                if !module.editable {
+                    continue;
+                }
+
+                for occurrence in &module.resolved_occurrences {
+                    if occurrence.definitions.iter().any(|index| {
+                        self.definitions
+                            .get(*index)
+                            .is_some_and(|definition| {
+                                target_identities.contains(&definition_identity(definition))
+                            })
+                    }) && let Ok(uri) = Url::from_file_path(&module.file_path)
+                    {
+                        push_unique_location(
+                            &mut locations,
+                            &mut seen,
+                            Location {
+                                uri,
+                                range: occurrence.range,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+
+        (!locations.is_empty()).then_some(locations)
+    }
+
+    pub fn prepare_rename_at(
+        &self,
+        document_path: &FsPath,
+        position: Position,
+    ) -> Result<PrepareRenameResponse, String> {
+        let target = self.rename_target_at(document_path, position)?;
+        Ok(PrepareRenameResponse::RangeWithPlaceholder {
+            range: target.range,
+            placeholder: target.placeholder,
+        })
+    }
+
+    pub fn rename_edits(
+        &self,
+        document_path: &FsPath,
+        position: Position,
+        new_name: &str,
+    ) -> Result<WorkspaceEdit, String> {
+        let target = self.rename_target_at(document_path, position)?;
+        validate_rename_name(target.kind, new_name)?;
+
+        let mut changes = HashMap::<Url, Vec<TextEdit>>::new();
+        let mut seen = BTreeSet::<String>::new();
+
+        for definition in &self.definitions {
+            if !definition.editable || !definition.renamable {
+                continue;
+            }
+            if definition_identity(definition) != target.identity {
+                continue;
+            }
+            if let Some(location) = definition.location() {
+                push_unique_text_edit(
+                    &mut changes,
+                    &mut seen,
+                    location.uri,
+                    definition.selection_range,
+                    new_name.to_string(),
+                );
+            }
+        }
+
+        for modules in self.modules_by_file.values() {
+            for module in modules {
+                if !module.editable {
+                    continue;
+                }
+
+                for occurrence in &module.resolved_occurrences {
+                    if occurrence.definitions.iter().any(|index| {
+                        self.definitions.get(*index).is_some_and(|definition| {
+                            definition_identity(definition) == target.identity
+                        })
+                    }) && let Ok(uri) = Url::from_file_path(&module.file_path)
+                    {
+                        push_unique_text_edit(
+                            &mut changes,
+                            &mut seen,
+                            uri,
+                            occurrence.range,
+                            new_name.to_string(),
+                        );
+                    }
+                }
+            }
+        }
+
+        if changes.is_empty() {
+            return Err("no editable references found for rename target".to_string());
+        }
+
+        for edits in changes.values_mut() {
+            edits.sort_by_key(|edit| {
+                (
+                    edit.range.start.line,
+                    edit.range.start.character,
+                    edit.range.end.line,
+                    edit.range.end.character,
+                )
+            });
+        }
+
+        Ok(WorkspaceEdit {
+            changes: Some(changes),
+            document_changes: None,
+            change_annotations: None,
+        })
+    }
+
+    pub fn completion_items(
+        &self,
+        document_path: &FsPath,
+        document_text: &str,
+        position: Position,
+    ) -> Vec<CompletionItem> {
+        let document_path = normalize_path(document_path);
+        let Some(modules) = self.modules_by_file.get(&document_path) else {
+            return Vec::new();
+        };
+        let Some(module) = pick_primary_module(modules) else {
+            return Vec::new();
+        };
+        let Some(query) = extract_completion_query(document_text, position) else {
+            return Vec::new();
+        };
+
+        let mut candidates = BTreeMap::<String, CompletionCandidate>::new();
+
+        if let Some(base_path) = query.base_path.as_deref() {
+            if let Some(resolved_base) = resolve_path_reference(
+                &module.local_names,
+                &module.imports,
+                &module.module_path,
+                base_path,
+                false,
+            ) {
+                for definition in &self.definitions {
+                    if !definition_visible_to_context(definition, &module.context) {
+                        continue;
+                    }
+                    if query.procedures_only && !matches!(definition.kind, ItemKind::Procedure) {
+                        continue;
+                    }
+                    let Some(label) = immediate_member_name(&resolved_base, &definition.path) else {
+                        continue;
+                    };
+                    if !label.starts_with(&query.prefix) {
+                        continue;
+                    }
+
+                    insert_completion_candidate(
+                        &mut candidates,
+                        label.to_string(),
+                        completion_candidate_from_definition(definition, 1),
+                    );
+                }
+            }
+        } else {
+            for definition in &module.definitions {
+                if matches!(definition.kind, ItemKind::Module) {
+                    continue;
+                }
+                if query.procedures_only && !matches!(definition.kind, ItemKind::Procedure) {
+                    continue;
+                }
+                if !definition.name.starts_with(&query.prefix) {
+                    continue;
+                }
+
+                insert_completion_candidate(
+                    &mut candidates,
+                    definition.name.clone(),
+                    completion_candidate_from_definition(definition, 0),
+                );
+            }
+
+            for (alias_name, import) in &module.imports {
+                if !alias_name.starts_with(&query.prefix) {
+                    continue;
+                }
+
+                let candidate = alias_target_to_path(import, &module.imports)
+                    .and_then(|path| visible_definition_for_path(self, &module.context, &path))
+                    .map(|definition| completion_candidate_from_definition(definition, 1))
+                    .unwrap_or_else(|| CompletionCandidate {
+                        detail: Some("import".to_string()),
+                        documentation: None,
+                        kind: CompletionItemKind::MODULE,
+                        priority: 1,
+                    });
+
+                insert_completion_candidate(&mut candidates, alias_name.clone(), candidate);
+            }
+        }
+
+        candidates
+            .into_iter()
+            .map(|(label, candidate)| CompletionItem {
+                label: label.clone(),
+                kind: Some(candidate.kind),
+                detail: candidate.detail,
+                documentation: candidate.documentation,
+                sort_text: Some(format!("{:02}-{label}", candidate.priority)),
+                text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                    range: query.replace_range,
+                    new_text: label,
+                })),
+                ..CompletionItem::default()
+            })
+            .collect()
+    }
+
+    fn symbol_at(
+        &self,
+        document_path: &FsPath,
+        position: Position,
+    ) -> Option<SymbolAt> {
+        let document_path = normalize_path(document_path);
+        let modules = self.modules_by_file.get(&document_path)?;
+
+        let mut ordered = modules.iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|module| module.priority);
+
+        let mut definition_indexes = Vec::new();
+        let mut range = None;
+
+        for module in ordered {
+            for definition in &module.definitions {
+                if contains_position(definition.selection_range, position) {
+                    range.get_or_insert(definition.selection_range);
+                    if let Some(indexes) = self
+                        .definitions_by_context
+                        .get(&definition.context)
+                        .and_then(|definitions| definitions.get(&definition.path))
+                    {
+                        definition_indexes.extend(indexes.iter().copied());
+                    }
+                }
+            }
+
+            for occurrence in &module.resolved_occurrences {
+                if contains_position(occurrence.range, position) {
+                    range.get_or_insert(occurrence.range);
+                    definition_indexes.extend(occurrence.definitions.iter().copied());
+                }
+            }
+        }
+
+        definition_indexes.sort_unstable();
+        definition_indexes.dedup();
+
+        range.map(|range| SymbolAt { definition_indexes, range })
+            .filter(|symbol| !symbol.definition_indexes.is_empty())
+    }
+
+    fn rename_target_at(
+        &self,
+        document_path: &FsPath,
+        position: Position,
+    ) -> Result<RenameTarget, String> {
+        let symbol = self
+            .symbol_at(document_path, position)
+            .ok_or_else(|| "no symbol found at the requested position".to_string())?;
+
+        let mut matches = symbol
+            .definition_indexes
+            .iter()
+            .filter_map(|index| self.definitions.get(*index))
+            .filter(|definition| definition.editable && definition.renamable)
+            .map(|definition| RenameTarget {
+                identity: definition_identity(definition),
+                kind: definition.kind.clone(),
+                placeholder: definition.name.clone(),
+                range: symbol.range,
+            })
+            .collect::<Vec<_>>();
+
+        matches.sort_by(|left, right| left.identity.cmp(&right.identity));
+        matches.dedup_by(|left, right| left.identity == right.identity);
+
+        match matches.len() {
+            0 => Err("the symbol at this position cannot be renamed".to_string()),
+            1 => Ok(matches.pop().unwrap()),
+            _ => Err("rename is ambiguous at this position".to_string()),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SymbolAt {
+    definition_indexes: Vec<usize>,
+    range: Range,
+}
+
+#[derive(Clone, Debug)]
+struct RenameTarget {
+    identity: String,
+    kind: ItemKind,
+    placeholder: String,
+    range: Range,
+}
+
+#[derive(Clone, Debug)]
+struct CompletionQuery {
+    base_path: Option<String>,
+    prefix: String,
+    procedures_only: bool,
+    replace_range: Range,
+}
+
+#[derive(Clone, Debug)]
+struct CompletionCandidate {
+    detail: Option<String>,
+    documentation: Option<Documentation>,
+    kind: CompletionItemKind,
+    priority: u8,
 }
 
 pub fn project_diagnostic(
@@ -709,6 +1071,7 @@ struct TargetContext {
     package_name: String,
     target: String,
     executable: bool,
+    editable: bool,
     namespace: Arc<MasmPath>,
     root_file: PathBuf,
     root_dir: PathBuf,
@@ -742,6 +1105,7 @@ fn target_contexts(package: &SourcePackageInput) -> Result<Vec<TargetContext>, S
             target.inner(),
             manifest_dir,
             &exec_roots,
+            matches!(package.mode, SourceMode::AllTargets),
         )?);
     }
 
@@ -753,6 +1117,7 @@ fn target_contexts(package: &SourcePackageInput) -> Result<Vec<TargetContext>, S
                     target.inner(),
                     manifest_dir,
                     &exec_roots,
+                    matches!(package.mode, SourceMode::AllTargets),
                 )?);
             }
         }
@@ -766,6 +1131,7 @@ fn build_target_context(
     target: &Target,
     manifest_dir: &FsPath,
     exec_roots: &BTreeSet<PathBuf>,
+    editable: bool,
 ) -> Result<TargetContext, String> {
     let root_path = target
         .path
@@ -785,6 +1151,7 @@ fn build_target_context(
 
     Ok(TargetContext {
         executable: target.is_executable(),
+        editable,
         namespace: target.namespace.inner().clone(),
         package_name,
         root_dir,
@@ -872,6 +1239,7 @@ fn analyze_source_module(
         },
         definitions: Vec::new(),
         document_symbols: Vec::new(),
+        editable: context.editable,
         file_path: file_path.to_path_buf(),
         imports: BTreeMap::new(),
         local_names: BTreeMap::new(),
@@ -890,6 +1258,7 @@ fn analyze_source_module(
             path: file_path.to_path_buf(),
             selection_range: module_selection,
         }),
+        editable: context.editable,
         module_path: module_path.clone(),
         name: module_path
             .rsplit("::")
@@ -897,6 +1266,7 @@ fn analyze_source_module(
             .unwrap_or(module_path.as_str())
             .to_string(),
         path: module_path.clone(),
+        renamable: false,
         selection_range: module_selection,
         symbol_kind: SymbolKind::MODULE,
         visible_outside_context: !context.executable,
@@ -1019,9 +1389,11 @@ fn parse_constant(
             path: module.file_path.clone(),
             selection_range,
         }),
+        editable: module.editable,
         module_path: module.module_path.clone(),
         name: ident.clone(),
         path: path.clone(),
+        renamable: module.editable,
         selection_range,
         symbol_kind: SymbolKind::CONSTANT,
         visible_outside_context: !module.context.executable,
@@ -1070,9 +1442,11 @@ fn parse_type_definition(
             path: module.file_path.clone(),
             selection_range,
         }),
+        editable: module.editable,
         module_path: module.module_path.clone(),
         name: ident.clone(),
         path: path.clone(),
+        renamable: module.editable,
         selection_range,
         symbol_kind: SymbolKind::CLASS,
         visible_outside_context: !module.context.executable,
@@ -1137,9 +1511,11 @@ fn parse_procedure(
             path: module.file_path.clone(),
             selection_range,
         }),
+        editable: module.editable,
         module_path: module.module_path.clone(),
         name: ident.clone(),
         path: path.clone(),
+        renamable: module.editable && !entrypoint,
         selection_range,
         symbol_kind: SymbolKind::FUNCTION,
         visible_outside_context: !module.context.executable,
@@ -1176,6 +1552,17 @@ fn record_body_references(module: &mut ModuleAnalysis, node: Node<'_>, parsed: &
                 module.raw_occurrences.push(RawOccurrence {
                     kind: ReferenceKind::Invoke,
                     range: node_range(path, parsed),
+                    raw_path: raw_path.to_string(),
+                });
+            }
+            continue;
+        }
+
+        if matches!(node.kind(), "const_path" | "const_ident") {
+            if let Ok(raw_path) = node_text(node, &parsed.text) {
+                module.raw_occurrences.push(RawOccurrence {
+                    kind: ReferenceKind::Constant,
+                    range: node_range(node, parsed),
                     raw_path: raw_path.to_string(),
                 });
             }
@@ -1329,6 +1716,15 @@ fn alias_target_to_path(
     import: &ImportAlias,
     imports: &BTreeMap<String, ImportAlias>,
 ) -> Option<String> {
+    let mut visited = BTreeSet::new();
+    alias_target_to_path_inner(import, imports, &mut visited)
+}
+
+fn alias_target_to_path_inner(
+    import: &ImportAlias,
+    imports: &BTreeMap<String, ImportAlias>,
+    visited: &mut BTreeSet<String>,
+) -> Option<String> {
     match &import.target {
         AliasTarget::Path(path) => {
             let path_text = canonicalize_path_text(path).ok()?;
@@ -1336,13 +1732,19 @@ fn alias_target_to_path(
             if path.is_absolute() {
                 Some(path.to_string())
             } else if let Some(ident) = path.as_ident() {
+                if !visited.insert(ident.as_str().to_string()) {
+                    return Some(path.to_absolute().to_string());
+                }
                 imports
                     .get(ident.as_str())
-                    .and_then(|next| alias_target_to_path(next, imports))
+                    .and_then(|next| alias_target_to_path_inner(next, imports, visited))
                     .or_else(|| Some(path.to_absolute().to_string()))
             } else if let Some((head, rest)) = path.split_first() {
+                if !visited.insert(head.to_string()) {
+                    return Some(path.to_absolute().to_string());
+                }
                 if let Some(next) = imports.get(head)
-                    && let Some(expanded) = alias_target_to_path(next, imports)
+                    && let Some(expanded) = alias_target_to_path_inner(next, imports, visited)
                 {
                     let expanded = MasmPath::new(expanded.as_str());
                     Some(expanded.join(rest).to_string())
@@ -1414,7 +1816,7 @@ fn index_metadata_package(
             },
             &path,
             signature.as_deref(),
-            Some(&format!("package: {}@{}", input.package.name, input.package.version)),
+            Some(&metadata_hover_notes(&input.package, export)),
         );
 
         let definition = Definition {
@@ -1422,9 +1824,11 @@ fn index_metadata_package(
             hover,
             kind,
             location: location.clone(),
+            editable: false,
             module_path: module_path.clone(),
             name: name.clone(),
             path: path.clone(),
+            renamable: false,
             selection_range: Range::new(Position::new(0, 0), Position::new(0, 0)),
             symbol_kind,
             visible_outside_context: true,
@@ -1465,6 +1869,7 @@ fn index_metadata_package(
             hover: format!("```masm\nmodule {module_path}\n```"),
             kind: ItemKind::Module,
             location: Some(location),
+            editable: false,
             module_path: module_path.clone(),
             name: module_path
                 .rsplit("::")
@@ -1472,6 +1877,7 @@ fn index_metadata_package(
                 .unwrap_or(module_path.as_str())
                 .to_string(),
             path: module_path,
+            renamable: false,
             selection_range: Range::new(Position::new(0, 0), Position::new(0, 0)),
             symbol_kind: SymbolKind::MODULE,
             visible_outside_context: true,
@@ -1596,6 +2002,259 @@ fn contains_position(range: Range, position: Position) -> bool {
             || (position.line == range.end.line && position.character <= range.end.character))
 }
 
+fn definition_identity(definition: &Definition) -> String {
+    match definition.location.as_ref() {
+        Some(DefinitionLocation::Source { path, selection_range }) => format!(
+            "source:{}:{}:{}:{}:{}:{}",
+            normalize_path(path).display(),
+            selection_range.start.line,
+            selection_range.start.character,
+            selection_range.end.line,
+            selection_range.end.character,
+            item_kind_tag(&definition.kind),
+        ),
+        Some(DefinitionLocation::Artifact { path }) => {
+            format!(
+                "artifact:{}:{}:{}:{}",
+                normalize_path(path).display(),
+                definition.context.package,
+                definition.context.target,
+                definition.path,
+            )
+        },
+        None => format!(
+            "logical:{}:{}:{}:{}",
+            definition.context.package,
+            definition.context.target,
+            definition.context.executable as u8,
+            definition.path,
+        ),
+    }
+}
+
+fn item_kind_tag(kind: &ItemKind) -> &'static str {
+    match kind {
+        ItemKind::Module => "module",
+        ItemKind::Procedure => "proc",
+        ItemKind::Constant => "const",
+        ItemKind::Type => "type",
+    }
+}
+
+fn definition_visible_to_context(definition: &Definition, context: &ContextKey) -> bool {
+    &definition.context == context || definition.visible_outside_context
+}
+
+fn visible_definition_for_path<'a>(
+    snapshot: &'a ProjectSnapshot,
+    context: &ContextKey,
+    path: &str,
+) -> Option<&'a Definition> {
+    snapshot
+        .definitions_by_context
+        .get(context)
+        .and_then(|definitions| definitions.get(path))
+        .into_iter()
+        .flatten()
+        .chain(snapshot.public_definitions.get(path).into_iter().flatten())
+        .find_map(|index| snapshot.definitions.get(*index))
+}
+
+fn immediate_member_name<'a>(base: &str, path: &'a str) -> Option<&'a str> {
+    let suffix = path.strip_prefix(base)?.strip_prefix("::")?;
+    (!suffix.is_empty() && !suffix.contains("::")).then_some(suffix)
+}
+
+fn completion_candidate_from_definition(
+    definition: &Definition,
+    priority: u8,
+) -> CompletionCandidate {
+    CompletionCandidate {
+        detail: Some(definition.path.clone()),
+        documentation: Some(Documentation::MarkupContent(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: definition.hover.clone(),
+        })),
+        kind: completion_kind_for_item(&definition.kind),
+        priority,
+    }
+}
+
+fn completion_kind_for_item(kind: &ItemKind) -> CompletionItemKind {
+    match kind {
+        ItemKind::Module => CompletionItemKind::MODULE,
+        ItemKind::Procedure => CompletionItemKind::FUNCTION,
+        ItemKind::Constant => CompletionItemKind::CONSTANT,
+        ItemKind::Type => CompletionItemKind::CLASS,
+    }
+}
+
+fn insert_completion_candidate(
+    candidates: &mut BTreeMap<String, CompletionCandidate>,
+    label: String,
+    candidate: CompletionCandidate,
+) {
+    match candidates.entry(label) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(candidate);
+        },
+        std::collections::btree_map::Entry::Occupied(mut entry) => {
+            if candidate.priority < entry.get().priority {
+                entry.insert(candidate);
+            }
+        },
+    }
+}
+
+fn extract_completion_query(text: &str, position: Position) -> Option<CompletionQuery> {
+    let line_offsets = compute_line_offsets(text);
+    let offset = position_to_offset(text, &line_offsets, position).ok()?;
+
+    let segment_start = scan_left_while(text, offset, is_completion_ident_char);
+    let segment_end = scan_right_while(text, offset, is_completion_ident_char);
+    let prefix = text.get(segment_start..offset)?.to_string();
+
+    let path_start = scan_left_while(text, segment_start, |ch| {
+        is_completion_ident_char(ch) || ch == ':'
+    });
+    let path_prefix = text.get(path_start..segment_start)?;
+
+    let procedures_only = if path_start > 0 && text[..path_start].chars().next_back() == Some('.') {
+        let kind_end = path_start - 1;
+        let kind_start = scan_left_while(text, kind_end, is_completion_ident_char);
+        matches!(
+            text.get(kind_start..kind_end),
+            Some("call" | "exec" | "syscall" | "procref")
+        )
+    } else {
+        false
+    };
+
+    let base_path = path_prefix
+        .strip_suffix("::")
+        .map(str::to_string)
+        .filter(|base| !base.is_empty());
+
+    Some(CompletionQuery {
+        base_path,
+        prefix,
+        procedures_only,
+        replace_range: byte_range_to_lsp_range(text, &line_offsets, segment_start..segment_end),
+    })
+}
+
+fn scan_left_while(
+    text: &str,
+    mut offset: usize,
+    predicate: impl Fn(char) -> bool,
+) -> usize {
+    while offset > 0 {
+        let ch = text[..offset].chars().next_back().unwrap();
+        if !predicate(ch) {
+            break;
+        }
+        offset -= ch.len_utf8();
+    }
+    offset
+}
+
+fn scan_right_while(
+    text: &str,
+    mut offset: usize,
+    predicate: impl Fn(char) -> bool,
+) -> usize {
+    while offset < text.len() {
+        let ch = text[offset..].chars().next().unwrap();
+        if !predicate(ch) {
+            break;
+        }
+        offset += ch.len_utf8();
+    }
+    offset
+}
+
+fn is_completion_ident_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$' | '"')
+}
+
+fn push_unique_location(
+    locations: &mut Vec<Location>,
+    seen: &mut BTreeSet<String>,
+    location: Location,
+) {
+    let key = format!(
+        "{}:{}:{}:{}:{}",
+        location.uri,
+        location.range.start.line,
+        location.range.start.character,
+        location.range.end.line,
+        location.range.end.character,
+    );
+    if seen.insert(key) {
+        locations.push(location);
+    }
+}
+
+fn push_unique_text_edit(
+    changes: &mut HashMap<Url, Vec<TextEdit>>,
+    seen: &mut BTreeSet<String>,
+    uri: Url,
+    range: Range,
+    new_text: String,
+) {
+    let key = format!(
+        "{}:{}:{}:{}:{}",
+        uri,
+        range.start.line,
+        range.start.character,
+        range.end.line,
+        range.end.character,
+    );
+    if seen.insert(key) {
+        changes.entry(uri).or_default().push(TextEdit { range, new_text });
+    }
+}
+
+fn validate_rename_name(kind: ItemKind, new_name: &str) -> Result<(), String> {
+    match kind {
+        ItemKind::Procedure => ProcedureName::new(new_name)
+            .map(|_| ())
+            .map_err(|error| format!("invalid procedure name '{new_name}': {error}")),
+        ItemKind::Constant => {
+            let ident = Ident::new(new_name)
+                .map_err(|error| format!("invalid constant name '{new_name}': {error}"))?;
+            if ident.is_constant_ident() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "invalid constant name '{new_name}': constant names must use SCREAMING_CASE"
+                ))
+            }
+        },
+        ItemKind::Type => Ident::new(new_name)
+            .map(|_| ())
+            .map_err(|error| format!("invalid type name '{new_name}': {error}")),
+        ItemKind::Module => Err("modules cannot be renamed".to_string()),
+    }
+}
+
+fn metadata_hover_notes(package: &MastPackage, export: &PackageExport) -> String {
+    let mut notes = format!("package: {}@{}", package.name, package.version);
+    if let PackageExport::Procedure(procedure) = export
+        && !procedure.attributes.is_empty()
+    {
+        let attributes = procedure
+            .attributes
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        notes.push_str("\n\nattributes:\n");
+        notes.push_str(&attributes);
+    }
+    notes
+}
+
 fn render_definition_block(
     keyword: &str,
     path: &str,
@@ -1640,6 +2299,8 @@ struct ResolutionIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::document::offset_to_position;
+    use tower_lsp::lsp_types::TextEdit;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -1650,6 +2311,25 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("miden-lsp-{name}-{suffix}"));
         fs::create_dir_all(&dir).unwrap();
         normalize_path(&dir)
+    }
+
+    fn position_of(text: &str, needle: &str) -> Position {
+        let offset = text.find(needle).unwrap();
+        offset_to_position(text, &compute_line_offsets(text), offset)
+    }
+
+    fn position_after(text: &str, needle: &str) -> Position {
+        let offset = text.find(needle).unwrap() + needle.len();
+        offset_to_position(text, &compute_line_offsets(text), offset)
+    }
+
+    fn collect_changes(edit: WorkspaceEdit) -> BTreeMap<PathBuf, Vec<TextEdit>> {
+        edit
+            .changes
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(uri, edits)| (normalize_path(&uri.to_file_path().unwrap()), edits))
+            .collect()
     }
 
     #[test]
@@ -1722,5 +2402,202 @@ mod tests {
             "helper",
         );
         assert!(symbols.iter().any(|symbol| symbol.name == "helper"));
+    }
+
+    #[test]
+    fn finds_references_across_workspace_members() {
+        let root = temp_dir("workspace-references");
+        let util_dir = root.join("util");
+        let app_dir = root.join("app");
+        fs::create_dir_all(&util_dir).unwrap();
+        fs::create_dir_all(&app_dir).unwrap();
+
+        fs::write(
+            root.join("miden-project.toml"),
+            "[workspace]\nmembers=[\"util\",\"app\"]\n[workspace.package]\nversion=\"0.1.0\"\\
+             n[workspace.dependencies]\nutil = { path = \"util\" }\n",
+        )
+        .unwrap();
+        fs::write(
+            util_dir.join("miden-project.toml"),
+            "[package]\nname=\"util\"\nversion.workspace=true\n[lib]\npath=\"mod.masm\"\\
+             nnamespace=\"util\"\n",
+        )
+        .unwrap();
+        let util_text = "pub proc helper\n    push.1\nend\n";
+        fs::write(util_dir.join("mod.masm"), util_text).unwrap();
+        fs::write(
+            app_dir.join("miden-project.toml"),
+            "[package]\nname=\"app\"\nversion.workspace=true\n[lib]\npath=\"mod.masm\"\\
+             nnamespace=\"app\"\n[dependencies]\nutil.workspace=true\n",
+        )
+        .unwrap();
+        let app_text = "use util\npub proc main\n    call.util::helper\n    call.util::helper\nend\n";
+        fs::write(app_dir.join("mod.masm"), app_text).unwrap();
+
+        let snapshot = ProjectSnapshot::load_for_document(
+            &util_dir.join("mod.masm"),
+            &OverlayMap::default(),
+            &RegistryState::default(),
+            None,
+        )
+        .unwrap();
+
+        let references = snapshot
+            .references_at(
+                &util_dir.join("mod.masm"),
+                position_of(util_text, "helper"),
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(references.len(), 3);
+        assert!(references.iter().any(|location| {
+            normalize_path(&location.uri.to_file_path().unwrap()) == util_dir.join("mod.masm")
+        }));
+        assert_eq!(
+            references
+                .iter()
+                .filter(|location| {
+                    normalize_path(&location.uri.to_file_path().unwrap()) == app_dir.join("mod.masm")
+                })
+                .count(),
+            2,
+        );
+    }
+
+    #[test]
+    fn renames_proc_const_and_type_symbols() {
+        let root = temp_dir("rename");
+        fs::write(
+            root.join("miden-project.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[lib]\npath = \
+             \"mod.masm\"\nnamespace = \"app\"\n",
+        )
+        .unwrap();
+        let text = "\
+type Value = felt
+const ERR_CODE = 1
+pub proc helper(value: Value)
+    push.ERR_CODE
+end
+pub proc main
+    call.helper
+end
+";
+        fs::write(root.join("mod.masm"), text).unwrap();
+
+        let snapshot = ProjectSnapshot::load_for_document(
+            &root.join("mod.masm"),
+            &OverlayMap::default(),
+            &RegistryState::default(),
+            None,
+        )
+        .unwrap();
+
+        let proc_edit = snapshot
+            .rename_edits(
+                &root.join("mod.masm"),
+                position_of(text, "helper(value"),
+                "renamed_helper",
+            )
+            .unwrap();
+        let proc_changes = collect_changes(proc_edit);
+        assert_eq!(proc_changes[&root.join("mod.masm")].len(), 2);
+        assert!(proc_changes[&root.join("mod.masm")]
+            .iter()
+            .all(|edit| edit.new_text == "renamed_helper"));
+
+        let const_edit = snapshot
+            .rename_edits(
+                &root.join("mod.masm"),
+                position_of(text, "ERR_CODE"),
+                "NEW_CODE",
+            )
+            .unwrap();
+        let const_changes = collect_changes(const_edit);
+        assert_eq!(const_changes[&root.join("mod.masm")].len(), 2);
+        assert!(const_changes[&root.join("mod.masm")]
+            .iter()
+            .all(|edit| edit.new_text == "NEW_CODE"));
+
+        let type_edit = snapshot
+            .rename_edits(
+                &root.join("mod.masm"),
+                position_of(text, "Value ="),
+                "Amount",
+            )
+            .unwrap();
+        let type_changes = collect_changes(type_edit);
+        assert_eq!(type_changes[&root.join("mod.masm")].len(), 2);
+        assert!(type_changes[&root.join("mod.masm")]
+            .iter()
+            .all(|edit| edit.new_text == "Amount"));
+    }
+
+    #[test]
+    fn completes_local_and_imported_symbols() {
+        let root = temp_dir("completion");
+        let util_dir = root.join("util");
+        let app_dir = root.join("app");
+        fs::create_dir_all(&util_dir).unwrap();
+        fs::create_dir_all(&app_dir).unwrap();
+
+        fs::write(
+            root.join("miden-project.toml"),
+            "[workspace]\nmembers=[\"util\",\"app\"]\n[workspace.package]\nversion=\"0.1.0\"\\
+             n[workspace.dependencies]\nutil = { path = \"util\" }\n",
+        )
+        .unwrap();
+        fs::write(
+            util_dir.join("miden-project.toml"),
+            "[package]\nname=\"util\"\nversion.workspace=true\n[lib]\npath=\"mod.masm\"\\
+             nnamespace=\"util\"\n",
+        )
+        .unwrap();
+        fs::write(util_dir.join("mod.masm"), "pub proc helper\n    push.1\nend\n").unwrap();
+        fs::write(
+            app_dir.join("miden-project.toml"),
+            "[package]\nname=\"app\"\nversion.workspace=true\n[lib]\npath=\"mod.masm\"\\
+             nnamespace=\"app\"\n[dependencies]\nutil.workspace=true\n",
+        )
+        .unwrap();
+
+        let app_text = "\
+use util
+pub proc helper_local
+    push.1
+end
+pub proc main
+    call.helper_local
+    call.util::helper
+end
+";
+        fs::write(app_dir.join("mod.masm"), app_text).unwrap();
+        let mut overlays = OverlayMap::default();
+        overlays.insert(app_dir.join("mod.masm"), app_text.to_string());
+
+        let snapshot = ProjectSnapshot::load_for_document(
+            &app_dir.join("mod.masm"),
+            &overlays,
+            &RegistryState::default(),
+            None,
+        )
+        .unwrap();
+
+        let local_items = snapshot.completion_items(
+            &app_dir.join("mod.masm"),
+            app_text,
+            position_after(app_text, "call.he"),
+        );
+        assert!(local_items.iter().any(|item| item.label == "helper_local"));
+
+        let imported_items = snapshot.completion_items(
+            &app_dir.join("mod.masm"),
+            app_text,
+            position_after(app_text, "call.util::he"),
+        );
+        assert!(imported_items.iter().any(|item| item.label == "helper"));
+        assert!(!imported_items.iter().any(|item| item.label == "helper_local"));
     }
 }

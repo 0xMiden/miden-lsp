@@ -9,11 +9,13 @@ use tower_lsp::{
     Client, LanguageServer,
     jsonrpc::Result,
     lsp_types::{
-        DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-        DidSaveTextDocumentParams, DocumentSymbolParams, GotoDefinitionParams,
-        GotoDefinitionResponse, Hover, HoverParams, InitializeParams, InitializeResult,
-        InitializedParams, MessageType, OneOf, ServerCapabilities, TextDocumentSyncCapability,
-        TextDocumentSyncKind, Url, WorkspaceFolder, WorkspaceSymbolParams,
+        CompletionOptions, CompletionParams, CompletionResponse, DidChangeTextDocumentParams,
+        DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
+        DocumentSymbolParams, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams,
+        InitializeParams, InitializeResult, InitializedParams, MessageType, OneOf,
+        PrepareRenameResponse, ReferenceParams, RenameOptions, RenameParams, ServerCapabilities,
+        TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
+        WorkspaceEdit, WorkspaceFolder, WorkspaceSymbolParams,
     },
 };
 
@@ -118,9 +120,18 @@ impl LanguageServer for Backend {
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
+                completion_provider: Some(CompletionOptions {
+                    trigger_characters: Some(vec![".".to_string(), ":".to_string()]),
+                    ..CompletionOptions::default()
+                }),
                 definition_provider: Some(OneOf::Left(true)),
                 document_symbol_provider: Some(OneOf::Left(true)),
                 hover_provider: Some(tower_lsp::lsp_types::HoverProviderCapability::Simple(true)),
+                references_provider: Some(OneOf::Left(true)),
+                rename_provider: Some(OneOf::Right(RenameOptions {
+                    prepare_provider: Some(true),
+                    work_done_progress_options: Default::default(),
+                })),
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::INCREMENTAL,
                 )),
@@ -229,6 +240,78 @@ impl LanguageServer for Backend {
             .snapshot_for_path(&path)
             .await
             .and_then(|snapshot| snapshot.hover_at(&path, position)))
+    }
+
+    async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<tower_lsp::lsp_types::Location>>> {
+        let position = params.text_document_position.position;
+        let uri = params.text_document_position.text_document.uri;
+        let path = match uri.to_file_path() {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+
+        Ok(self
+            .snapshot_for_path(&path)
+            .await
+            .and_then(|snapshot| {
+                snapshot.references_at(&path, position, params.context.include_declaration)
+            }))
+    }
+
+    async fn prepare_rename(
+        &self,
+        params: TextDocumentPositionParams,
+    ) -> Result<Option<PrepareRenameResponse>> {
+        let position = params.position;
+        let path = match params.text_document.uri.to_file_path() {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+
+        Ok(self
+            .snapshot_for_path(&path)
+            .await
+            .and_then(|snapshot| snapshot.prepare_rename_at(&path, position).ok()))
+    }
+
+    async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
+        let position = params.text_document_position.position;
+        let path = match params.text_document_position.text_document.uri.to_file_path() {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+
+        Ok(self
+            .snapshot_for_path(&path)
+            .await
+            .and_then(|snapshot| snapshot.rename_edits(&path, position, &params.new_name).ok()))
+    }
+
+    async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
+        let position = params.text_document_position.position;
+        let uri = params.text_document_position.text_document.uri;
+        let path = match uri.to_file_path() {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+
+        let text = {
+            let state = self.state.read().await;
+            state
+                .documents
+                .get(&uri)
+                .map(|document| document.text().to_string())
+        }
+        .or_else(|| std::fs::read_to_string(&path).ok());
+
+        let Some(text) = text else {
+            return Ok(None);
+        };
+
+        Ok(self
+            .snapshot_for_path(&path)
+            .await
+            .map(|snapshot| CompletionResponse::Array(snapshot.completion_items(&path, &text, position))))
     }
 
     async fn symbol(
