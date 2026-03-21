@@ -19,7 +19,14 @@ impl TextDocument {
     pub fn new(uri: Url, version: i32, text: String) -> Result<Self, String> {
         let (tree, syntax_diagnostics) = parse_text(&text)?;
         let line_offsets = compute_line_offsets(&text);
-        Ok(Self { uri, version, text, line_offsets, tree, syntax_diagnostics })
+        Ok(Self {
+            uri,
+            version,
+            text,
+            line_offsets,
+            tree,
+            syntax_diagnostics,
+        })
     }
 
     pub fn uri(&self) -> &Url {
@@ -110,8 +117,8 @@ pub fn position_to_offset(
 
     let line_end = line_offsets.get(line + 1).copied().unwrap_or(text.len());
     let line_text = &text[line_start..line_end];
-    let target_units = usize::try_from(position.character)
-        .map_err(|_| "character offset overflow".to_string())?;
+    let target_units =
+        usize::try_from(position.character).map_err(|_| "character offset overflow".to_string())?;
 
     let mut utf16_units = 0usize;
     for (offset, ch) in line_text.char_indices() {
@@ -147,7 +154,11 @@ pub fn point_to_position(point: Point) -> Position {
     Position::new(point.row as u32, point.column as u32)
 }
 
-pub fn byte_range_to_lsp_range(text: &str, line_offsets: &[usize], range: StdRange<usize>) -> Range {
+pub fn byte_range_to_lsp_range(
+    text: &str,
+    line_offsets: &[usize],
+    range: StdRange<usize>,
+) -> Range {
     Range::new(
         offset_to_position(text, line_offsets, range.start),
         offset_to_position(text, line_offsets, range.end),
@@ -184,9 +195,8 @@ fn collect_syntax_diagnostics(text: &str, tree: &Tree) -> Vec<Diagnostic> {
         }
     }
 
-    diagnostics.sort_by_key(|diagnostic| {
-        (diagnostic.range.start.line, diagnostic.range.start.character)
-    });
+    diagnostics
+        .sort_by_key(|diagnostic| (diagnostic.range.start.line, diagnostic.range.start.character));
     diagnostics.dedup_by(|left, right| left.range == right.range && left.message == right.message);
     diagnostics
 }

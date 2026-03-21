@@ -9,18 +9,25 @@ use tower_lsp::{
     Client, LanguageServer,
     jsonrpc::Result,
     lsp_types::{
-        CompletionOptions, CompletionParams, CompletionResponse, DidChangeTextDocumentParams,
-        DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
-        DocumentSymbolParams, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams,
-        InitializeParams, InitializeResult, InitializedParams, MessageType, OneOf,
-        PrepareRenameResponse, ReferenceParams, RenameOptions, RenameParams, ServerCapabilities,
-        TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
-        WorkspaceEdit, WorkspaceFolder, WorkspaceSymbolParams,
+        CodeLens, CodeLensOptions, CodeLensParams, CompletionOptions, CompletionParams,
+        CompletionResponse, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
+        DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentSymbolParams,
+        ExecuteCommandOptions, ExecuteCommandParams, GotoDefinitionParams, GotoDefinitionResponse,
+        Hover, HoverParams, InitializeParams, InitializeResult, InitializedParams, InlayHint,
+        InlayHintOptions, InlayHintParams, InlayHintServerCapabilities, MessageType, OneOf,
+        PrepareRenameResponse, ReferenceParams, RenameOptions, RenameParams,
+        SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams,
+        SemanticTokensResult, ServerCapabilities, TextDocumentPositionParams,
+        TextDocumentSyncCapability, TextDocumentSyncKind, Url, WorkspaceEdit, WorkspaceFolder,
+        WorkspaceSymbolParams,
     },
 };
 
 use crate::{
-    analysis::{InitializationOptions, ProjectSnapshot, RegistryState, normalize_path, project_diagnostic},
+    analysis::{
+        InitializationOptions, ProjectSnapshot, RegistryState, SHOW_SYMBOL_INFO_COMMAND,
+        normalize_path, project_diagnostic, semantic_token_legend,
+    },
     document::TextDocument,
 };
 
@@ -54,7 +61,10 @@ pub struct Backend {
 
 impl Backend {
     pub fn new(client: Client) -> Self {
-        Self { client, state: Arc::new(RwLock::new(ServerState::default())) }
+        Self {
+            client,
+            state: Arc::new(RwLock::new(ServerState::default())),
+        }
     }
 
     async fn publish_diagnostics(&self, uri: Url, include_project: bool) {
@@ -76,9 +86,7 @@ impl Backend {
             (document.version(), diagnostics)
         };
 
-        self.client
-            .publish_diagnostics(uri, diagnostics.1, Some(diagnostics.0))
-            .await;
+        self.client.publish_diagnostics(uri, diagnostics.1, Some(diagnostics.0)).await;
     }
 
     async fn snapshot_for_path(&self, path: &Path) -> Option<ProjectSnapshot> {
@@ -120,18 +128,40 @@ impl LanguageServer for Backend {
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
+                code_lens_provider: Some(CodeLensOptions {
+                    resolve_provider: Some(false),
+                }),
                 completion_provider: Some(CompletionOptions {
                     trigger_characters: Some(vec![".".to_string(), ":".to_string()]),
                     ..CompletionOptions::default()
                 }),
                 definition_provider: Some(OneOf::Left(true)),
                 document_symbol_provider: Some(OneOf::Left(true)),
+                execute_command_provider: Some(ExecuteCommandOptions {
+                    commands: vec![SHOW_SYMBOL_INFO_COMMAND.to_string()],
+                    work_done_progress_options: Default::default(),
+                }),
                 hover_provider: Some(tower_lsp::lsp_types::HoverProviderCapability::Simple(true)),
+                inlay_hint_provider: Some(OneOf::Right(InlayHintServerCapabilities::Options(
+                    InlayHintOptions {
+                        resolve_provider: Some(false),
+                        work_done_progress_options: Default::default(),
+                    },
+                ))),
                 references_provider: Some(OneOf::Left(true)),
                 rename_provider: Some(OneOf::Right(RenameOptions {
                     prepare_provider: Some(true),
                     work_done_progress_options: Default::default(),
                 })),
+                semantic_tokens_provider: Some(
+                    SemanticTokensOptions {
+                        work_done_progress_options: Default::default(),
+                        legend: semantic_token_legend(),
+                        range: Some(false),
+                        full: Some(SemanticTokensFullOptions::Bool(true)),
+                    }
+                    .into(),
+                ),
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::INCREMENTAL,
                 )),
@@ -143,9 +173,7 @@ impl LanguageServer for Backend {
     }
 
     async fn initialized(&self, _: InitializedParams) {
-        self.client
-            .log_message(MessageType::INFO, "miden-lsp initialized")
-            .await;
+        self.client.log_message(MessageType::INFO, "miden-lsp initialized").await;
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -156,16 +184,12 @@ impl LanguageServer for Backend {
         let document = params.text_document;
         match TextDocument::new(document.uri.clone(), document.version, document.text) {
             Ok(text_document) => {
-                self.state
-                    .write()
-                    .await
-                    .documents
-                    .insert(document.uri.clone(), text_document);
+                self.state.write().await.documents.insert(document.uri.clone(), text_document);
                 self.publish_diagnostics(document.uri, true).await;
-            },
+            }
             Err(error) => {
                 self.client.log_message(MessageType::ERROR, error).await;
-            },
+            }
         }
     }
 
@@ -181,7 +205,7 @@ impl LanguageServer for Backend {
                 drop(state);
                 self.client.log_message(MessageType::ERROR, error).await;
                 return;
-            },
+            }
         }
 
         self.publish_diagnostics(params.text_document.uri, false).await;
@@ -207,7 +231,10 @@ impl LanguageServer for Backend {
             Err(_) => return Ok(None),
         };
 
-        Ok(self.snapshot_for_path(&path).await.and_then(|snapshot| snapshot.document_symbols(&path)))
+        Ok(self
+            .snapshot_for_path(&path)
+            .await
+            .and_then(|snapshot| snapshot.document_symbols(&path)))
     }
 
     async fn goto_definition(
@@ -242,10 +269,8 @@ impl LanguageServer for Backend {
             .and_then(|snapshot| snapshot.hover_at(&path, position)))
     }
 
-    async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<tower_lsp::lsp_types::Location>>> {
-        let position = params.text_document_position.position;
-        let uri = params.text_document_position.text_document.uri;
-        let path = match uri.to_file_path() {
+    async fn code_lens(&self, params: CodeLensParams) -> Result<Option<Vec<CodeLens>>> {
+        let path = match params.text_document.uri.to_file_path() {
             Ok(path) => path,
             Err(_) => return Ok(None),
         };
@@ -253,9 +278,23 @@ impl LanguageServer for Backend {
         Ok(self
             .snapshot_for_path(&path)
             .await
-            .and_then(|snapshot| {
-                snapshot.references_at(&path, position, params.context.include_declaration)
-            }))
+            .and_then(|snapshot| snapshot.code_lenses(&path)))
+    }
+
+    async fn references(
+        &self,
+        params: ReferenceParams,
+    ) -> Result<Option<Vec<tower_lsp::lsp_types::Location>>> {
+        let position = params.text_document_position.position;
+        let uri = params.text_document_position.text_document.uri;
+        let path = match uri.to_file_path() {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+
+        Ok(self.snapshot_for_path(&path).await.and_then(|snapshot| {
+            snapshot.references_at(&path, position, params.context.include_declaration)
+        }))
     }
 
     async fn prepare_rename(
@@ -287,6 +326,33 @@ impl LanguageServer for Backend {
             .and_then(|snapshot| snapshot.rename_edits(&path, position, &params.new_name).ok()))
     }
 
+    async fn semantic_tokens_full(
+        &self,
+        params: SemanticTokensParams,
+    ) -> Result<Option<SemanticTokensResult>> {
+        let path = match params.text_document.uri.to_file_path() {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+
+        Ok(self
+            .snapshot_for_path(&path)
+            .await
+            .and_then(|snapshot| snapshot.semantic_tokens(&path)))
+    }
+
+    async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
+        let path = match params.text_document.uri.to_file_path() {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+
+        Ok(self
+            .snapshot_for_path(&path)
+            .await
+            .and_then(|snapshot| snapshot.inlay_hints(&path, params.range)))
+    }
+
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
         let position = params.text_document_position.position;
         let uri = params.text_document_position.text_document.uri;
@@ -297,10 +363,7 @@ impl LanguageServer for Backend {
 
         let text = {
             let state = self.state.read().await;
-            state
-                .documents
-                .get(&uri)
-                .map(|document| document.text().to_string())
+            state.documents.get(&uri).map(|document| document.text().to_string())
         }
         .or_else(|| std::fs::read_to_string(&path).ok());
 
@@ -308,10 +371,9 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
 
-        Ok(self
-            .snapshot_for_path(&path)
-            .await
-            .map(|snapshot| CompletionResponse::Array(snapshot.completion_items(&path, &text, position))))
+        Ok(self.snapshot_for_path(&path).await.map(|snapshot| {
+            CompletionResponse::Array(snapshot.completion_items(&path, &text, position))
+        }))
     }
 
     async fn symbol(
@@ -328,6 +390,21 @@ impl LanguageServer for Backend {
         );
         Ok(Some(symbols))
     }
+
+    async fn execute_command(
+        &self,
+        params: ExecuteCommandParams,
+    ) -> Result<Option<serde_json::Value>> {
+        match params.command.as_str() {
+            SHOW_SYMBOL_INFO_COMMAND => {
+                if let Some(message) = params.arguments.first().and_then(|value| value.as_str()) {
+                    self.client.show_message(MessageType::INFO, message).await;
+                }
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
+    }
 }
 
 fn root_workspace_folder(root_uri: Option<Url>) -> Vec<WorkspaceFolder> {
@@ -337,7 +414,9 @@ fn root_workspace_folder(root_uri: Option<Url>) -> Vec<WorkspaceFolder> {
                 name: uri
                     .to_file_path()
                     .ok()
-                    .and_then(|path| path.file_name().map(|name| name.to_string_lossy().into_owned()))
+                    .and_then(|path| {
+                        path.file_name().map(|name| name.to_string_lossy().into_owned())
+                    })
                     .unwrap_or_else(|| "workspace".to_string()),
                 uri,
             }]

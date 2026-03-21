@@ -23,15 +23,18 @@ use miden_project::{
 };
 use serde::Deserialize;
 use tower_lsp::lsp_types::{
-    CompletionItem, CompletionItemKind, CompletionTextEdit, Diagnostic, DiagnosticSeverity,
-    Documentation, DocumentSymbol, DocumentSymbolResponse, Hover, HoverContents, Location,
-    MarkupContent, MarkupKind, Position, PrepareRenameResponse, Range, SymbolInformation,
-    SymbolKind, TextEdit, Url, WorkspaceEdit,
+    CodeLens, Command, CompletionItem, CompletionItemKind, CompletionTextEdit, Diagnostic,
+    DiagnosticSeverity, DocumentSymbol, DocumentSymbolResponse, Documentation, Hover,
+    HoverContents, InlayHint, InlayHintKind, InlayHintLabel, InlayHintLabelPart, InlayHintTooltip,
+    Location, MarkupContent, MarkupKind, Position, PrepareRenameResponse, Range, SemanticToken,
+    SemanticTokenModifier, SemanticTokenType, SemanticTokens, SemanticTokensLegend,
+    SemanticTokensResult, SymbolInformation, SymbolKind, TextEdit, Url, WorkspaceEdit,
 };
 use tree_sitter::{Node, Tree};
 
 use crate::document::{
-    byte_range_to_lsp_range, compute_line_offsets, parse_text, position_to_offset,
+    byte_range_to_lsp_range, compute_line_offsets, offset_to_position, parse_text,
+    position_to_offset,
 };
 
 type OverlayMap = BTreeMap<PathBuf, String>;
@@ -72,12 +75,12 @@ impl RegistryState {
 
         let mut pending = Vec::new();
         for artifact_path in &options.registry_artifacts {
-            let bytes = fs::read(artifact_path)
-                .map_err(|error| format!("failed to read '{}': {error}", artifact_path.display()))?;
-            let package = Arc::new(
-                MastPackage::read_from_bytes(&bytes)
-                    .map_err(|error| format!("failed to decode '{}': {error}", artifact_path.display()))?,
-            );
+            let bytes = fs::read(artifact_path).map_err(|error| {
+                format!("failed to read '{}': {error}", artifact_path.display())
+            })?;
+            let package = Arc::new(MastPackage::read_from_bytes(&bytes).map_err(|error| {
+                format!("failed to decode '{}': {error}", artifact_path.display())
+            })?);
             pending.push((artifact_path.clone(), package));
         }
 
@@ -88,11 +91,9 @@ impl RegistryState {
             for (artifact_path, package) in pending {
                 match state.registry.publish_package(package.clone()) {
                     Ok(version) => {
-                        state
-                            .artifacts
-                            .insert((package.name.clone(), version), artifact_path);
+                        state.artifacts.insert((package.name.clone(), version), artifact_path);
                         published += 1;
-                    },
+                    }
                     Err(_) => remaining.push((artifact_path, package)),
                 }
             }
@@ -140,8 +141,13 @@ enum ItemKind {
 
 #[derive(Clone, Debug)]
 enum DefinitionLocation {
-    Source { path: PathBuf, selection_range: Range },
-    Artifact { path: PathBuf },
+    Source {
+        path: PathBuf,
+        selection_range: Range,
+    },
+    Artifact {
+        path: PathBuf,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -153,8 +159,11 @@ struct Definition {
     kind: ItemKind,
     symbol_kind: SymbolKind,
     hover: String,
+    signature: Option<String>,
     location: Option<DefinitionLocation>,
     editable: bool,
+    exported: bool,
+    entrypoint: bool,
     renamable: bool,
     visible_outside_context: bool,
     selection_range: Range,
@@ -163,7 +172,10 @@ struct Definition {
 impl Definition {
     fn location(&self) -> Option<Location> {
         match self.location.as_ref()? {
-            DefinitionLocation::Source { path, selection_range } => Some(Location {
+            DefinitionLocation::Source {
+                path,
+                selection_range,
+            } => Some(Location {
                 uri: Url::from_file_path(path).ok()?,
                 range: *selection_range,
             }),
@@ -198,7 +210,7 @@ struct ImportAlias {
     target: AliasTarget,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum ReferenceKind {
     Invoke,
     ImportAlias,
@@ -217,6 +229,7 @@ struct RawOccurrence {
 #[derive(Clone, Debug)]
 struct ResolvedOccurrence {
     range: Range,
+    kind: ReferenceKind,
     definitions: Vec<usize>,
 }
 
@@ -259,7 +272,11 @@ impl ModuleAnalysis {
                 if resolved.is_empty() {
                     None
                 } else {
-                    Some(ResolvedOccurrence { range: occurrence.range, definitions: resolved })
+                    Some(ResolvedOccurrence {
+                        range: occurrence.range,
+                        kind: occurrence.kind.clone(),
+                        definitions: resolved,
+                    })
                 }
             })
             .collect();
@@ -268,6 +285,7 @@ impl ModuleAnalysis {
 
 #[derive(Debug, Default)]
 pub struct ProjectSnapshot {
+    parsed_files: BTreeMap<PathBuf, ParsedFile>,
     modules_by_file: BTreeMap<PathBuf, Vec<ModuleAnalysis>>,
     definitions: Vec<Definition>,
     definitions_by_context: BTreeMap<ContextKey, BTreeMap<String, Vec<usize>>>,
@@ -319,7 +337,8 @@ impl ProjectSnapshot {
                 if matches!(definition.kind, ItemKind::Module) {
                     continue;
                 }
-                let haystack = format!("{} {}", definition.name, definition.module_path).to_lowercase();
+                let haystack =
+                    format!("{} {}", definition.name, definition.module_path).to_lowercase();
                 if haystack.contains(&needle)
                     && let Some(symbol) = definition.workspace_symbol()
                 {
@@ -330,21 +349,14 @@ impl ProjectSnapshot {
         symbols
     }
 
-    pub fn document_symbols(
-        &self,
-        document_path: &FsPath,
-    ) -> Option<DocumentSymbolResponse> {
+    pub fn document_symbols(&self, document_path: &FsPath) -> Option<DocumentSymbolResponse> {
         let document_path = normalize_path(document_path);
         let modules = self.modules_by_file.get(&document_path)?;
         let module = pick_primary_module(modules)?;
         Some(DocumentSymbolResponse::Nested(module.document_symbols.clone()))
     }
 
-    pub fn definition_at(
-        &self,
-        document_path: &FsPath,
-        position: Position,
-    ) -> Option<Location> {
+    pub fn definition_at(&self, document_path: &FsPath, position: Position) -> Option<Location> {
         let document_path = normalize_path(document_path);
         let modules = self.modules_by_file.get(&document_path)?;
 
@@ -362,7 +374,9 @@ impl ProjectSnapshot {
             for occurrence in &module.resolved_occurrences {
                 if contains_position(occurrence.range, position) {
                     for index in &occurrence.definitions {
-                        if let Some(location) = self.definitions.get(*index).and_then(Definition::location) {
+                        if let Some(location) =
+                            self.definitions.get(*index).and_then(Definition::location)
+                        {
                             return Some(location);
                         }
                     }
@@ -373,11 +387,7 @@ impl ProjectSnapshot {
         None
     }
 
-    pub fn hover_at(
-        &self,
-        document_path: &FsPath,
-        position: Position,
-    ) -> Option<Hover> {
+    pub fn hover_at(&self, document_path: &FsPath, position: Position) -> Option<Hover> {
         let document_path = normalize_path(document_path);
         let modules = self.modules_by_file.get(&document_path)?;
 
@@ -438,11 +448,9 @@ impl ProjectSnapshot {
 
                 for occurrence in &module.resolved_occurrences {
                     if occurrence.definitions.iter().any(|index| {
-                        self.definitions
-                            .get(*index)
-                            .is_some_and(|definition| {
-                                target_identities.contains(&definition_identity(definition))
-                            })
+                        self.definitions.get(*index).is_some_and(|definition| {
+                            target_identities.contains(&definition_identity(definition))
+                        })
                     }) && let Ok(uri) = Url::from_file_path(&module.file_path)
                     {
                         push_unique_location(
@@ -584,7 +592,8 @@ impl ProjectSnapshot {
                     if query.procedures_only && !matches!(definition.kind, ItemKind::Procedure) {
                         continue;
                     }
-                    let Some(label) = immediate_member_name(&resolved_base, &definition.path) else {
+                    let Some(label) = immediate_member_name(&resolved_base, &definition.path)
+                    else {
                         continue;
                     };
                     if !label.starts_with(&query.prefix) {
@@ -653,11 +662,162 @@ impl ProjectSnapshot {
             .collect()
     }
 
-    fn symbol_at(
+    pub fn semantic_tokens(&self, document_path: &FsPath) -> Option<SemanticTokensResult> {
+        let document_path = normalize_path(document_path);
+        let parsed = self.parsed_files.get(&document_path)?;
+        let modules = self.modules_by_file.get(&document_path)?;
+        let module = pick_primary_module(modules)?;
+
+        let mut tokens = BTreeMap::<(u32, u32, u32), (u8, AbsoluteSemanticToken)>::new();
+        collect_syntax_semantic_tokens(parsed, &mut tokens);
+
+        for definition in &module.definitions {
+            let (token_type, modifiers) = match definition.kind {
+                ItemKind::Module => continue,
+                ItemKind::Procedure => (TOKEN_TYPE_FUNCTION, TOKEN_MODIFIER_DECLARATION),
+                ItemKind::Constant => {
+                    (TOKEN_TYPE_VARIABLE, TOKEN_MODIFIER_DECLARATION | TOKEN_MODIFIER_READONLY)
+                }
+                ItemKind::Type => (TOKEN_TYPE_TYPE, TOKEN_MODIFIER_DECLARATION),
+            };
+            push_semantic_token_range(
+                parsed,
+                &mut tokens,
+                definition.selection_range,
+                token_type,
+                modifiers,
+                0,
+            );
+        }
+
+        for occurrence in &module.resolved_occurrences {
+            let Some(_) = self.definition_for_occurrence(&module.context, occurrence) else {
+                continue;
+            };
+            let (token_type, modifiers) = match occurrence.kind {
+                ReferenceKind::Invoke => (TOKEN_TYPE_FUNCTION, 0),
+                ReferenceKind::ImportAlias | ReferenceKind::ImportTarget => {
+                    (TOKEN_TYPE_NAMESPACE, 0)
+                }
+                ReferenceKind::Constant => (TOKEN_TYPE_VARIABLE, TOKEN_MODIFIER_READONLY),
+                ReferenceKind::Type => (TOKEN_TYPE_TYPE, 0),
+            };
+            push_semantic_token_range(
+                parsed,
+                &mut tokens,
+                occurrence.range,
+                token_type,
+                modifiers,
+                1,
+            );
+        }
+
+        Some(SemanticTokensResult::Tokens(SemanticTokens {
+            result_id: None,
+            data: encode_semantic_tokens(tokens.into_values().map(|(_, token)| token).collect()),
+        }))
+    }
+
+    pub fn inlay_hints(
         &self,
         document_path: &FsPath,
-        position: Position,
-    ) -> Option<SymbolAt> {
+        visible_range: Range,
+    ) -> Option<Vec<InlayHint>> {
+        let document_path = normalize_path(document_path);
+        let modules = self.modules_by_file.get(&document_path)?;
+        let module = pick_primary_module(modules)?;
+
+        let mut hints = Vec::new();
+        for occurrence in &module.resolved_occurrences {
+            if occurrence.kind != ReferenceKind::Invoke
+                || !ranges_overlap(occurrence.range, visible_range)
+            {
+                continue;
+            }
+
+            let Some(definition) = self.definition_for_occurrence(&module.context, occurrence)
+            else {
+                continue;
+            };
+            let Some(signature) = definition.signature.as_deref() else {
+                continue;
+            };
+
+            hints.push(InlayHint {
+                position: occurrence.range.end,
+                label: InlayHintLabel::LabelParts(vec![InlayHintLabelPart {
+                    value: format!(" {signature}"),
+                    tooltip: Some(
+                        MarkupContent {
+                            kind: MarkupKind::Markdown,
+                            value: definition.hover.clone(),
+                        }
+                        .into(),
+                    ),
+                    location: definition.location(),
+                    command: None,
+                }]),
+                kind: Some(InlayHintKind::TYPE),
+                text_edits: None,
+                tooltip: Some(InlayHintTooltip::MarkupContent(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: format!("resolved to `{}`", definition.path),
+                })),
+                padding_left: Some(true),
+                padding_right: None,
+                data: None,
+            });
+        }
+
+        Some(hints)
+    }
+
+    pub fn code_lenses(&self, document_path: &FsPath) -> Option<Vec<CodeLens>> {
+        let document_path = normalize_path(document_path);
+        let modules = self.modules_by_file.get(&document_path)?;
+        let module = pick_primary_module(modules)?;
+
+        let mut lenses = Vec::new();
+        for definition in &module.definitions {
+            if !matches!(definition.kind, ItemKind::Procedure) {
+                continue;
+            }
+
+            let (title, message) = if definition.entrypoint {
+                (
+                    format!("Entrypoint {}", definition.path),
+                    format!(
+                        "{} is the executable entrypoint for target `{}`.",
+                        definition.path, definition.context.target
+                    ),
+                )
+            } else if definition.exported {
+                (
+                    format!("Exported as {}", definition.path),
+                    format!("{} is exported from this package.", definition.path),
+                )
+            } else {
+                continue;
+            };
+
+            lenses.push(CodeLens {
+                range: Range::new(
+                    definition.selection_range.start,
+                    definition.selection_range.start,
+                ),
+                command: Some(Command::new(
+                    title,
+                    SHOW_SYMBOL_INFO_COMMAND.to_string(),
+                    Some(vec![serde_json::Value::String(message)]),
+                )),
+                data: None,
+            });
+        }
+
+        Some(lenses)
+    }
+
+    fn symbol_at(&self, document_path: &FsPath, position: Position) -> Option<SymbolAt> {
         let document_path = normalize_path(document_path);
         let modules = self.modules_by_file.get(&document_path)?;
 
@@ -692,8 +852,31 @@ impl ProjectSnapshot {
         definition_indexes.sort_unstable();
         definition_indexes.dedup();
 
-        range.map(|range| SymbolAt { definition_indexes, range })
+        range
+            .map(|range| SymbolAt {
+                definition_indexes,
+                range,
+            })
             .filter(|symbol| !symbol.definition_indexes.is_empty())
+    }
+
+    fn definition_for_occurrence<'a>(
+        &'a self,
+        context: &ContextKey,
+        occurrence: &ResolvedOccurrence,
+    ) -> Option<&'a Definition> {
+        occurrence
+            .definitions
+            .iter()
+            .filter_map(|index| self.definitions.get(*index))
+            .find(|definition| definition_visible_to_context(definition, context))
+            .or_else(|| {
+                occurrence
+                    .definitions
+                    .iter()
+                    .filter_map(|index| self.definitions.get(*index))
+                    .next()
+            })
     }
 
     fn rename_target_at(
@@ -759,12 +942,65 @@ struct CompletionCandidate {
     priority: u8,
 }
 
+pub const SHOW_SYMBOL_INFO_COMMAND: &str = "miden-lsp.showSymbolInfo";
+
+const TOKEN_TYPE_NAMESPACE: u32 = 0;
+const TOKEN_TYPE_TYPE: u32 = 1;
+const TOKEN_TYPE_FUNCTION: u32 = 2;
+const TOKEN_TYPE_KEYWORD: u32 = 3;
+const TOKEN_TYPE_COMMENT: u32 = 4;
+const TOKEN_TYPE_STRING: u32 = 5;
+const TOKEN_TYPE_NUMBER: u32 = 6;
+const TOKEN_TYPE_PARAMETER: u32 = 7;
+const TOKEN_TYPE_PROPERTY: u32 = 8;
+const TOKEN_TYPE_VARIABLE: u32 = 9;
+
+const TOKEN_MODIFIER_DECLARATION: u32 = 1 << 0;
+const TOKEN_MODIFIER_READONLY: u32 = 1 << 1;
+const TOKEN_MODIFIER_DOCUMENTATION: u32 = 1 << 2;
+
+pub fn semantic_token_legend() -> SemanticTokensLegend {
+    SemanticTokensLegend {
+        token_types: vec![
+            SemanticTokenType::NAMESPACE,
+            SemanticTokenType::TYPE,
+            SemanticTokenType::FUNCTION,
+            SemanticTokenType::KEYWORD,
+            SemanticTokenType::COMMENT,
+            SemanticTokenType::STRING,
+            SemanticTokenType::NUMBER,
+            SemanticTokenType::PARAMETER,
+            SemanticTokenType::PROPERTY,
+            SemanticTokenType::VARIABLE,
+        ],
+        token_modifiers: vec![
+            SemanticTokenModifier::DECLARATION,
+            SemanticTokenModifier::READONLY,
+            SemanticTokenModifier::DOCUMENTATION,
+        ],
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AbsoluteSemanticToken {
+    line: u32,
+    start: u32,
+    length: u32,
+    token_type: u32,
+    token_modifiers_bitset: u32,
+}
+
 pub fn project_diagnostic(
     document_path: &FsPath,
     registry: &RegistryState,
     git_cache_root: Option<&FsPath>,
 ) -> Option<Diagnostic> {
-    let snapshot = ProjectSnapshot::load_for_document(document_path, &OverlayMap::default(), registry, git_cache_root);
+    let snapshot = ProjectSnapshot::load_for_document(
+        document_path,
+        &OverlayMap::default(),
+        registry,
+        git_cache_root,
+    );
     match snapshot {
         Ok(_) => None,
         Err(message) => Some(Diagnostic {
@@ -826,7 +1062,7 @@ impl RootAnalysis {
                     package,
                     SourceMode::AllTargets,
                 );
-            },
+            }
             Project::WorkspacePackage { package, workspace } => {
                 remember_source_package(
                     &mut source_packages,
@@ -842,7 +1078,7 @@ impl RootAnalysis {
                         SourceMode::AllTargets,
                     );
                 }
-            },
+            }
         }
 
         let mut metadata_packages = Vec::new();
@@ -880,21 +1116,21 @@ impl RootAnalysis {
                         package,
                         SourceMode::LibraryOnly,
                     );
-                },
+                }
                 ProjectDependencyNodeProvenance::Preassembled { path, .. } => {
-                    let bytes =
-                        fs::read(path).map_err(|error| format!("failed to read '{}': {error}", path.display()))?;
-                    let package = Arc::new(
-                        MastPackage::read_from_bytes(&bytes)
-                            .map_err(|error| format!("failed to decode '{}': {error}", path.display()))?,
-                    );
+                    let bytes = fs::read(path)
+                        .map_err(|error| format!("failed to read '{}': {error}", path.display()))?;
+                    let package =
+                        Arc::new(MastPackage::read_from_bytes(&bytes).map_err(|error| {
+                            format!("failed to decode '{}': {error}", path.display())
+                        })?);
                     if seen_metadata.insert(package.name.to_string()) {
                         metadata_packages.push(MetadataPackageInput {
                             package,
                             artifact_path: Some(path.clone()),
                         });
                     }
-                },
+                }
                 ProjectDependencyNodeProvenance::Registry { selected, .. } => {
                     let package = registry
                         .registry()
@@ -906,11 +1142,14 @@ impl RootAnalysis {
                             package,
                         });
                     }
-                },
+                }
             }
         }
 
-        Ok(Self { source_packages, metadata_packages })
+        Ok(Self {
+            source_packages,
+            metadata_packages,
+        })
     }
 
     fn for_manifest(
@@ -929,7 +1168,10 @@ impl RootAnalysis {
             let workspace = miden_project::Workspace::load(source_file, source_manager.as_ref())
                 .map_err(|error| error.to_string())?;
 
-            let mut root = Self { source_packages: Vec::new(), metadata_packages: Vec::new() };
+            let mut root = Self {
+                source_packages: Vec::new(),
+                metadata_packages: Vec::new(),
+            };
             let mut seen_manifests = BTreeSet::new();
             for member in workspace.members() {
                 remember_source_package(
@@ -983,10 +1225,7 @@ fn find_manifest_path(path: &FsPath) -> Result<PathBuf, String> {
         current = parent.to_path_buf();
     }
 
-    Err(format!(
-        "failed to locate miden-project.toml for '{}'",
-        path.display()
-    ))
+    Err(format!("failed to locate miden-project.toml for '{}'", path.display()))
 }
 
 fn remember_source_package(
@@ -1017,6 +1256,7 @@ fn build_snapshot(
             for file_path in collect_target_files(&context)? {
                 let priority = primary_priority(&context.target, &file_path, &file_counts);
                 let parsed = parse_file(&file_path, overlays)?;
+                snapshot.parsed_files.entry(file_path.clone()).or_insert_with(|| parsed.clone());
                 let module = analyze_source_module(&context, &file_path, priority, &parsed)?;
 
                 for definition in &module.definitions {
@@ -1038,11 +1278,7 @@ fn build_snapshot(
                     snapshot.definitions.push(definition.clone());
                 }
 
-                snapshot
-                    .modules_by_file
-                    .entry(file_path.clone())
-                    .or_default()
-                    .push(module);
+                snapshot.modules_by_file.entry(file_path.clone()).or_default().push(module);
             }
         }
     }
@@ -1051,17 +1287,17 @@ fn build_snapshot(
         index_metadata_package(&mut snapshot, package, registry)?;
     }
 
-        let resolution_index = ResolutionIndex {
-            definitions_by_context: snapshot.definitions_by_context.clone(),
-            public_definitions: snapshot.public_definitions.clone(),
-        };
+    let resolution_index = ResolutionIndex {
+        definitions_by_context: snapshot.definitions_by_context.clone(),
+        public_definitions: snapshot.public_definitions.clone(),
+    };
 
-        for modules in snapshot.modules_by_file.values_mut() {
-            for module in modules.iter_mut() {
-                module.resolve_occurrences(&resolution_index);
-            }
-            modules.sort_by_key(|module| module.priority);
+    for modules in snapshot.modules_by_file.values_mut() {
+        for module in modules.iter_mut() {
+            module.resolve_occurrences(&resolution_index);
         }
+        modules.sort_by_key(|module| module.priority);
+    }
 
     Ok(snapshot)
 }
@@ -1079,10 +1315,9 @@ struct TargetContext {
 }
 
 fn target_contexts(package: &SourcePackageInput) -> Result<Vec<TargetContext>, String> {
-    let manifest_path = package
-        .package
-        .manifest_path()
-        .ok_or_else(|| format!("package '{}' has no manifest path", package.package.name().inner()))?;
+    let manifest_path = package.package.manifest_path().ok_or_else(|| {
+        format!("package '{}' has no manifest path", package.package.name().inner())
+    })?;
     let manifest_dir = manifest_path
         .parent()
         .ok_or_else(|| format!("manifest '{}' has no parent", manifest_path.display()))?;
@@ -1171,11 +1406,7 @@ fn count_context_files(contexts: &[TargetContext]) -> Result<BTreeMap<PathBuf, u
     Ok(counts)
 }
 
-fn primary_priority(
-    context: &str,
-    file_path: &FsPath,
-    counts: &BTreeMap<PathBuf, usize>,
-) -> usize {
+fn primary_priority(context: &str, file_path: &FsPath, counts: &BTreeMap<PathBuf, usize>) -> usize {
     let shared = counts.get(file_path).copied().unwrap_or_default() > 1;
     if !shared {
         0
@@ -1221,7 +1452,11 @@ fn parse_file(path: &FsPath, overlays: &OverlayMap) -> Result<ParsedFile, String
     };
     let (tree, _) = parse_text(&text)?;
     let line_offsets = compute_line_offsets(&text);
-    Ok(ParsedFile { line_offsets, text, tree })
+    Ok(ParsedFile {
+        line_offsets,
+        text,
+        tree,
+    })
 }
 
 fn analyze_source_module(
@@ -1254,17 +1489,16 @@ fn analyze_source_module(
         context: module.context.clone(),
         hover: format!("```masm\nmodule {module_path}\n```"),
         kind: ItemKind::Module,
+        signature: None,
         location: Some(DefinitionLocation::Source {
             path: file_path.to_path_buf(),
             selection_range: module_selection,
         }),
         editable: context.editable,
+        exported: !context.executable,
+        entrypoint: false,
         module_path: module_path.clone(),
-        name: module_path
-            .rsplit("::")
-            .next()
-            .unwrap_or(module_path.as_str())
-            .to_string(),
+        name: module_path.rsplit("::").next().unwrap_or(module_path.as_str()).to_string(),
         path: module_path.clone(),
         renamable: false,
         selection_range: module_selection,
@@ -1280,10 +1514,10 @@ fn analyze_source_module(
             "import" => {
                 parse_import(&mut module, child, parsed)?;
                 pending_docs.clear();
-            },
+            }
             "constant" => {
                 parse_constant(&mut module, child, parsed, take_docs(&mut pending_docs))?;
-            },
+            }
             "type_alias" | "enum_declaration" => {
                 parse_type_definition(
                     &mut module,
@@ -1292,13 +1526,13 @@ fn analyze_source_module(
                     take_docs(&mut pending_docs),
                     child.kind() == "enum_declaration",
                 )?;
-            },
+            }
             "procedure" => {
                 parse_procedure(&mut module, child, parsed, take_docs(&mut pending_docs), false)?;
-            },
+            }
             "entrypoint" => {
                 parse_procedure(&mut module, child, parsed, take_docs(&mut pending_docs), true)?;
-            },
+            }
             _ => pending_docs.clear(),
         }
     }
@@ -1341,9 +1575,12 @@ fn parse_import(
         "mast_root" => AliasTarget::MastRoot,
         _ => AliasTarget::Path(canonicalize_path_text(&target_text)?),
     };
-    module
-        .imports
-        .insert(alias_name.clone(), ImportAlias { target: import_target });
+    module.imports.insert(
+        alias_name.clone(),
+        ImportAlias {
+            target: import_target,
+        },
+    );
 
     module.raw_occurrences.push(RawOccurrence {
         kind: ReferenceKind::ImportTarget,
@@ -1380,23 +1617,27 @@ fn parse_constant(
     let selection_range = node_range(name, parsed);
     let full_range = node_range(node, parsed);
     let hover = render_definition_block("const", &path, None, docs.as_deref());
+    let exported = node.child_by_field_name("visibility").is_some() && !module.context.executable;
 
     module.definitions.push(Definition {
         context: module.context.clone(),
         hover,
         kind: ItemKind::Constant,
+        signature: None,
         location: Some(DefinitionLocation::Source {
             path: module.file_path.clone(),
             selection_range,
         }),
         editable: module.editable,
+        exported,
+        entrypoint: false,
         module_path: module.module_path.clone(),
         name: ident.clone(),
         path: path.clone(),
         renamable: module.editable,
         selection_range,
         symbol_kind: SymbolKind::CONSTANT,
-        visible_outside_context: !module.context.executable,
+        visible_outside_context: exported,
     });
 
     #[allow(deprecated)]
@@ -1433,23 +1674,27 @@ fn parse_type_definition(
     let full_range = node_range(node, parsed);
     let keyword = if is_enum { "enum" } else { "type" };
     let hover = render_definition_block(keyword, &path, None, docs.as_deref());
+    let exported = node.child_by_field_name("visibility").is_some() && !module.context.executable;
 
     module.definitions.push(Definition {
         context: module.context.clone(),
         hover,
         kind: ItemKind::Type,
+        signature: None,
         location: Some(DefinitionLocation::Source {
             path: module.file_path.clone(),
             selection_range,
         }),
         editable: module.editable,
+        exported,
+        entrypoint: false,
         module_path: module.module_path.clone(),
         name: ident.clone(),
         path: path.clone(),
         renamable: module.editable,
         selection_range,
         symbol_kind: SymbolKind::CLASS,
-        visible_outside_context: !module.context.executable,
+        visible_outside_context: exported,
     });
 
     #[allow(deprecated)]
@@ -1476,10 +1721,7 @@ fn parse_procedure(
     entrypoint: bool,
 ) -> Result<(), String> {
     let (name_node, ident) = if entrypoint {
-        (
-            None,
-            ProcedureName::MAIN_PROC_NAME.to_string(),
-        )
+        (None, ProcedureName::MAIN_PROC_NAME.to_string())
     } else {
         let name = node
             .child_by_field_name("name")
@@ -1502,23 +1744,29 @@ fn parse_procedure(
     };
     let full_range = node_range(node, parsed);
     let hover = render_definition_block("proc", &path, signature.as_deref(), docs.as_deref());
+    let exported = !entrypoint
+        && node.child_by_field_name("visibility").is_some()
+        && !module.context.executable;
 
     module.definitions.push(Definition {
         context: module.context.clone(),
         hover,
         kind: ItemKind::Procedure,
+        signature: signature.clone(),
         location: Some(DefinitionLocation::Source {
             path: module.file_path.clone(),
             selection_range,
         }),
         editable: module.editable,
+        exported,
+        entrypoint,
         module_path: module.module_path.clone(),
         name: ident.clone(),
         path: path.clone(),
         renamable: module.editable && !entrypoint,
         selection_range,
         symbol_kind: SymbolKind::FUNCTION,
-        visible_outside_context: !module.context.executable,
+        visible_outside_context: exported,
     });
 
     #[allow(deprecated)]
@@ -1594,7 +1842,7 @@ fn record_nested_references(
                         raw_path: raw_path.to_string(),
                     });
                 }
-            },
+            }
             "const_path" if include_const_paths || !include_type_paths => {
                 if let Ok(raw_path) = node_text(node, &parsed.text) {
                     module.raw_occurrences.push(RawOccurrence {
@@ -1603,7 +1851,7 @@ fn record_nested_references(
                         raw_path: raw_path.to_string(),
                     });
                 }
-            },
+            }
             _ => (),
         }
 
@@ -1625,19 +1873,17 @@ fn resolve_reference(
     let resolved_path = match occurrence.kind {
         ReferenceKind::Invoke => {
             resolve_path_reference(local_names, imports, module_path, &occurrence.raw_path, true)
-        },
+        }
         ReferenceKind::ImportAlias => imports
             .get(&occurrence.raw_path)
             .and_then(|import| alias_target_to_path(import, imports)),
-        ReferenceKind::ImportTarget => {
-            resolve_import_target(imports, &occurrence.raw_path)
-        },
+        ReferenceKind::ImportTarget => resolve_import_target(imports, &occurrence.raw_path),
         ReferenceKind::Constant => {
             resolve_path_reference(local_names, imports, module_path, &occurrence.raw_path, false)
-        },
+        }
         ReferenceKind::Type => {
             resolve_path_reference(local_names, imports, module_path, &occurrence.raw_path, false)
-        },
+        }
     };
 
     let Some(resolved_path) = resolved_path else {
@@ -1683,7 +1929,11 @@ fn resolve_path_reference(
         if let Some(import) = imports.get(&ident) {
             return alias_target_to_path(import, imports);
         }
-        return if invoke { Some(format!("{module_path}::{ident}")) } else { None };
+        return if invoke {
+            Some(format!("{module_path}::{ident}"))
+        } else {
+            None
+        };
     }
 
     let (head, rest) = path.split_first()?;
@@ -1706,7 +1956,9 @@ fn resolve_import_target(
     if path.is_absolute() {
         Some(path.to_string())
     } else if let Some(ident) = path.as_ident() {
-        imports.get(ident.as_str()).and_then(|import| alias_target_to_path(import, imports))
+        imports
+            .get(ident.as_str())
+            .and_then(|import| alias_target_to_path(import, imports))
     } else {
         Some(path.to_absolute().to_string())
     }
@@ -1754,7 +2006,7 @@ fn alias_target_to_path_inner(
             } else {
                 None
             }
-        },
+        }
         AliasTarget::MastRoot => None,
     }
 }
@@ -1789,22 +2041,19 @@ fn index_metadata_package(
         };
 
         let location = match export {
-            PackageExport::Procedure(procedure) => debug_location_for_procedure(
-                procedure,
-                &debug_sources,
-                &debug_functions,
-            )
-            .map(DefinitionLocation::from)
-            .or_else(|| {
-                input
-                    .artifact_path
-                    .clone()
-                    .map(|path| DefinitionLocation::Artifact { path })
-            }),
-            PackageExport::Constant(_) | PackageExport::Type(_) => input
-                .artifact_path
-                .clone()
-                .map(|path| DefinitionLocation::Artifact { path }),
+            PackageExport::Procedure(procedure) => {
+                debug_location_for_procedure(procedure, &debug_sources, &debug_functions)
+                    .map(DefinitionLocation::from)
+                    .or_else(|| {
+                        input
+                            .artifact_path
+                            .clone()
+                            .map(|path| DefinitionLocation::Artifact { path })
+                    })
+            }
+            PackageExport::Constant(_) | PackageExport::Type(_) => {
+                input.artifact_path.clone().map(|path| DefinitionLocation::Artifact { path })
+            }
         };
 
         let hover = render_definition_block(
@@ -1823,8 +2072,11 @@ fn index_metadata_package(
             context: context.clone(),
             hover,
             kind,
+            signature,
             location: location.clone(),
             editable: false,
+            exported: true,
+            entrypoint: false,
             module_path: module_path.clone(),
             name: name.clone(),
             path: path.clone(),
@@ -1834,9 +2086,9 @@ fn index_metadata_package(
             visible_outside_context: true,
         };
 
-    if let Some(location) = location {
-        module_locations.entry(module_path.clone()).or_insert(location);
-    }
+        if let Some(location) = location {
+            module_locations.entry(module_path.clone()).or_insert(location);
+        }
 
         let index = snapshot.definitions.len();
         snapshot
@@ -1859,23 +2111,18 @@ fn index_metadata_package(
             .entry(module_path.clone())
             .or_default()
             .push(index);
-        snapshot
-            .public_definitions
-            .entry(module_path.clone())
-            .or_default()
-            .push(index);
+        snapshot.public_definitions.entry(module_path.clone()).or_default().push(index);
         snapshot.definitions.push(Definition {
             context: context.clone(),
             hover: format!("```masm\nmodule {module_path}\n```"),
             kind: ItemKind::Module,
+            signature: None,
             location: Some(location),
             editable: false,
+            exported: true,
+            entrypoint: false,
             module_path: module_path.clone(),
-            name: module_path
-                .rsplit("::")
-                .next()
-                .unwrap_or(module_path.as_str())
-                .to_string(),
+            name: module_path.rsplit("::").next().unwrap_or(module_path.as_str()).to_string(),
             path: module_path,
             renamable: false,
             selection_range: Range::new(Position::new(0, 0), Position::new(0, 0)),
@@ -1909,8 +2156,10 @@ fn read_debug_sources(package: &MastPackage) -> Option<DebugSourcesSection> {
 }
 
 fn read_debug_functions(package: &MastPackage) -> Option<DebugFunctionsSection> {
-    let section =
-        package.sections.iter().find(|section| section.id == SectionId::DEBUG_FUNCTIONS)?;
+    let section = package
+        .sections
+        .iter()
+        .find(|section| section.id == SectionId::DEBUG_FUNCTIONS)?;
     DebugFunctionsSection::read_from_bytes(section.data.as_ref()).ok()
 }
 
@@ -1932,7 +2181,10 @@ fn debug_location_for_procedure(
     Some(SourceDebugLocation {
         path: PathBuf::from(file_path.as_ref()),
         range: Range::new(
-            Position::new(function.line.to_u32().saturating_sub(1), function.column.to_u32().saturating_sub(1)),
+            Position::new(
+                function.line.to_u32().saturating_sub(1),
+                function.column.to_u32().saturating_sub(1),
+            ),
             Position::new(function.line.to_u32().saturating_sub(1), function.column.to_u32()),
         ),
     })
@@ -1943,9 +2195,7 @@ fn module_path_for_file(context: &TargetContext, file_path: &FsPath) -> Result<S
         return Ok(context.namespace.as_str().to_string());
     }
 
-    let relative = file_path
-        .strip_prefix(&context.root_dir)
-        .map_err(|error| error.to_string())?;
+    let relative = file_path.strip_prefix(&context.root_dir).map_err(|error| error.to_string())?;
     let mut module_path = context.namespace.to_path_buf();
     let mut components = relative.components().collect::<Vec<_>>();
     if components.is_empty() {
@@ -2004,7 +2254,10 @@ fn contains_position(range: Range, position: Position) -> bool {
 
 fn definition_identity(definition: &Definition) -> String {
     match definition.location.as_ref() {
-        Some(DefinitionLocation::Source { path, selection_range }) => format!(
+        Some(DefinitionLocation::Source {
+            path,
+            selection_range,
+        }) => format!(
             "source:{}:{}:{}:{}:{}:{}",
             normalize_path(path).display(),
             selection_range.start.line,
@@ -2021,7 +2274,7 @@ fn definition_identity(definition: &Definition) -> String {
                 definition.context.target,
                 definition.path,
             )
-        },
+        }
         None => format!(
             "logical:{}:{}:{}:{}",
             definition.context.package,
@@ -2097,12 +2350,12 @@ fn insert_completion_candidate(
     match candidates.entry(label) {
         std::collections::btree_map::Entry::Vacant(entry) => {
             entry.insert(candidate);
-        },
+        }
         std::collections::btree_map::Entry::Occupied(mut entry) => {
             if candidate.priority < entry.get().priority {
                 entry.insert(candidate);
             }
-        },
+        }
     }
 }
 
@@ -2114,18 +2367,14 @@ fn extract_completion_query(text: &str, position: Position) -> Option<Completion
     let segment_end = scan_right_while(text, offset, is_completion_ident_char);
     let prefix = text.get(segment_start..offset)?.to_string();
 
-    let path_start = scan_left_while(text, segment_start, |ch| {
-        is_completion_ident_char(ch) || ch == ':'
-    });
+    let path_start =
+        scan_left_while(text, segment_start, |ch| is_completion_ident_char(ch) || ch == ':');
     let path_prefix = text.get(path_start..segment_start)?;
 
     let procedures_only = if path_start > 0 && text[..path_start].chars().next_back() == Some('.') {
         let kind_end = path_start - 1;
         let kind_start = scan_left_while(text, kind_end, is_completion_ident_char);
-        matches!(
-            text.get(kind_start..kind_end),
-            Some("call" | "exec" | "syscall" | "procref")
-        )
+        matches!(text.get(kind_start..kind_end), Some("call" | "exec" | "syscall" | "procref"))
     } else {
         false
     };
@@ -2143,11 +2392,7 @@ fn extract_completion_query(text: &str, position: Position) -> Option<Completion
     })
 }
 
-fn scan_left_while(
-    text: &str,
-    mut offset: usize,
-    predicate: impl Fn(char) -> bool,
-) -> usize {
+fn scan_left_while(text: &str, mut offset: usize, predicate: impl Fn(char) -> bool) -> usize {
     while offset > 0 {
         let ch = text[..offset].chars().next_back().unwrap();
         if !predicate(ch) {
@@ -2158,11 +2403,7 @@ fn scan_left_while(
     offset
 }
 
-fn scan_right_while(
-    text: &str,
-    mut offset: usize,
-    predicate: impl Fn(char) -> bool,
-) -> usize {
+fn scan_right_while(text: &str, mut offset: usize, predicate: impl Fn(char) -> bool) -> usize {
     while offset < text.len() {
         let ch = text[offset..].chars().next().unwrap();
         if !predicate(ch) {
@@ -2204,11 +2445,7 @@ fn push_unique_text_edit(
 ) {
     let key = format!(
         "{}:{}:{}:{}:{}",
-        uri,
-        range.start.line,
-        range.start.character,
-        range.end.line,
-        range.end.character,
+        uri, range.start.line, range.start.character, range.end.line, range.end.character,
     );
     if seen.insert(key) {
         changes.entry(uri).or_default().push(TextEdit { range, new_text });
@@ -2230,7 +2467,7 @@ fn validate_rename_name(kind: ItemKind, new_name: &str) -> Result<(), String> {
                     "invalid constant name '{new_name}': constant names must use SCREAMING_CASE"
                 ))
             }
-        },
+        }
         ItemKind::Type => Ident::new(new_name)
             .map(|_| ())
             .map_err(|error| format!("invalid type name '{new_name}': {error}")),
@@ -2286,6 +2523,230 @@ fn render_hover(definition: &Definition) -> Hover {
     }
 }
 
+fn collect_syntax_semantic_tokens(
+    parsed: &ParsedFile,
+    tokens: &mut BTreeMap<(u32, u32, u32), (u8, AbsoluteSemanticToken)>,
+) {
+    let mut stack = vec![parsed.tree.root_node()];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "comment" => {
+                push_semantic_token_range(
+                    parsed,
+                    tokens,
+                    node_range(node, parsed),
+                    TOKEN_TYPE_COMMENT,
+                    0,
+                    4,
+                );
+                continue;
+            }
+            "doc_comment" => {
+                push_semantic_token_range(
+                    parsed,
+                    tokens,
+                    node_range(node, parsed),
+                    TOKEN_TYPE_COMMENT,
+                    TOKEN_MODIFIER_DOCUMENTATION,
+                    4,
+                );
+                continue;
+            }
+            "string" | "quoted_ident" => {
+                push_semantic_token_range(
+                    parsed,
+                    tokens,
+                    node_range(node, parsed),
+                    TOKEN_TYPE_STRING,
+                    0,
+                    4,
+                );
+            }
+            "integer" | "decimal" | "hex" | "hex_word" | "binary" | "word" => {
+                push_semantic_token_range(
+                    parsed,
+                    tokens,
+                    node_range(node, parsed),
+                    TOKEN_TYPE_NUMBER,
+                    0,
+                    4,
+                );
+            }
+            "visibility" => {
+                push_semantic_token_range(
+                    parsed,
+                    tokens,
+                    node_range(node, parsed),
+                    TOKEN_TYPE_KEYWORD,
+                    0,
+                    4,
+                );
+            }
+            "primitive_type" | "int_type" | "address_space" => {
+                push_semantic_token_range(
+                    parsed,
+                    tokens,
+                    node_range(node, parsed),
+                    TOKEN_TYPE_TYPE,
+                    0,
+                    4,
+                );
+            }
+            "function_param" | "function_result" => {
+                if let Some(name) = node.child_by_field_name("name") {
+                    push_semantic_token_range(
+                        parsed,
+                        tokens,
+                        node_range(name, parsed),
+                        TOKEN_TYPE_PARAMETER,
+                        TOKEN_MODIFIER_DECLARATION,
+                        3,
+                    );
+                }
+            }
+            "struct_field" | "meta_key_value" => {
+                if let Some(name) = node.child_by_field_name("name") {
+                    push_semantic_token_range(
+                        parsed,
+                        tokens,
+                        node_range(name, parsed),
+                        TOKEN_TYPE_PROPERTY,
+                        TOKEN_MODIFIER_DECLARATION,
+                        3,
+                    );
+                }
+            }
+            _ => (),
+        }
+
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+}
+
+fn push_semantic_token_range(
+    parsed: &ParsedFile,
+    tokens: &mut BTreeMap<(u32, u32, u32), (u8, AbsoluteSemanticToken)>,
+    range: Range,
+    token_type: u32,
+    token_modifiers_bitset: u32,
+    priority: u8,
+) {
+    let Ok(mut start_offset) = position_to_offset(&parsed.text, &parsed.line_offsets, range.start)
+    else {
+        return;
+    };
+    let Ok(end_offset) = position_to_offset(&parsed.text, &parsed.line_offsets, range.end) else {
+        return;
+    };
+    if end_offset <= start_offset {
+        return;
+    }
+
+    let start_line = range.start.line;
+    let end_line = range.end.line;
+
+    for line in start_line..=end_line {
+        let Ok(line_index) = usize::try_from(line) else {
+            return;
+        };
+        let Some(&line_start_offset) = parsed.line_offsets.get(line_index) else {
+            return;
+        };
+        let line_end_offset =
+            parsed.line_offsets.get(line_index + 1).copied().unwrap_or(parsed.text.len());
+
+        let segment_start = start_offset.max(line_start_offset);
+        let segment_end = end_offset.min(line_end_offset);
+        if segment_end <= segment_start {
+            continue;
+        }
+
+        let start_position = offset_to_position(&parsed.text, &parsed.line_offsets, segment_start);
+        let end_position = offset_to_position(&parsed.text, &parsed.line_offsets, segment_end);
+        let length = end_position.character.saturating_sub(start_position.character);
+        if length == 0 {
+            continue;
+        }
+
+        insert_semantic_token(
+            tokens,
+            AbsoluteSemanticToken {
+                line,
+                start: start_position.character,
+                length,
+                token_type,
+                token_modifiers_bitset,
+            },
+            priority,
+        );
+
+        start_offset = segment_end;
+    }
+}
+
+fn insert_semantic_token(
+    tokens: &mut BTreeMap<(u32, u32, u32), (u8, AbsoluteSemanticToken)>,
+    token: AbsoluteSemanticToken,
+    priority: u8,
+) {
+    let key = (token.line, token.start, token.length);
+    match tokens.entry(key) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert((priority, token));
+        }
+        std::collections::btree_map::Entry::Occupied(mut entry) => {
+            if priority < entry.get().0 {
+                entry.insert((priority, token));
+            }
+        }
+    }
+}
+
+fn encode_semantic_tokens(mut tokens: Vec<AbsoluteSemanticToken>) -> Vec<SemanticToken> {
+    tokens.sort_by_key(|token| (token.line, token.start, token.length, token.token_type));
+
+    let mut result = Vec::with_capacity(tokens.len());
+    let mut previous_line = 0u32;
+    let mut previous_start = 0u32;
+    let mut first = true;
+
+    for token in tokens {
+        let delta_line = if first {
+            token.line
+        } else {
+            token.line.saturating_sub(previous_line)
+        };
+        let delta_start = if first || delta_line > 0 {
+            token.start
+        } else {
+            token.start.saturating_sub(previous_start)
+        };
+        result.push(SemanticToken {
+            delta_line,
+            delta_start,
+            length: token.length,
+            token_type: token.token_type,
+            token_modifiers_bitset: token.token_modifiers_bitset,
+        });
+        previous_line = token.line;
+        previous_start = token.start;
+        first = false;
+    }
+
+    result
+}
+
+fn ranges_overlap(left: Range, right: Range) -> bool {
+    !position_before(left.end, right.start) && !position_before(right.end, left.start)
+}
+
+fn position_before(left: Position, right: Position) -> bool {
+    left.line < right.line || (left.line == right.line && left.character < right.character)
+}
+
 fn pick_primary_module(modules: &[ModuleAnalysis]) -> Option<&ModuleAnalysis> {
     modules.iter().min_by_key(|module| module.priority)
 }
@@ -2300,14 +2761,11 @@ struct ResolutionIndex {
 mod tests {
     use super::*;
     use crate::document::offset_to_position;
-    use tower_lsp::lsp_types::TextEdit;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tower_lsp::lsp_types::TextEdit;
 
     fn temp_dir(name: &str) -> PathBuf {
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let dir = std::env::temp_dir().join(format!("miden-lsp-{name}-{suffix}"));
         fs::create_dir_all(&dir).unwrap();
         normalize_path(&dir)
@@ -2324,12 +2782,67 @@ mod tests {
     }
 
     fn collect_changes(edit: WorkspaceEdit) -> BTreeMap<PathBuf, Vec<TextEdit>> {
-        edit
-            .changes
+        edit.changes
             .unwrap_or_default()
             .into_iter()
             .map(|(uri, edits)| (normalize_path(&uri.to_file_path().unwrap()), edits))
             .collect()
+    }
+
+    fn decode_semantic_tokens(result: SemanticTokensResult) -> Vec<AbsoluteSemanticToken> {
+        let SemanticTokensResult::Tokens(tokens) = result else {
+            panic!("expected full semantic tokens result");
+        };
+
+        let mut absolute = Vec::new();
+        let mut line = 0u32;
+        let mut start = 0u32;
+        let mut first = true;
+
+        for token in tokens.data {
+            if first {
+                line = token.delta_line;
+                start = token.delta_start;
+                first = false;
+            } else {
+                line += token.delta_line;
+                if token.delta_line == 0 {
+                    start += token.delta_start;
+                } else {
+                    start = token.delta_start;
+                }
+            }
+
+            absolute.push(AbsoluteSemanticToken {
+                line,
+                start,
+                length: token.length,
+                token_type: token.token_type,
+                token_modifiers_bitset: token.token_modifiers_bitset,
+            });
+        }
+
+        absolute
+    }
+
+    fn assert_token_at(
+        tokens: &[AbsoluteSemanticToken],
+        position: Position,
+        token_type: u32,
+        token_modifiers_bitset: u32,
+    ) {
+        assert!(
+            tokens.iter().any(|token| {
+                token.line == position.line
+                    && token.start == position.character
+                    && token.token_type == token_type
+                    && token.token_modifiers_bitset == token_modifiers_bitset
+            }),
+            "missing semantic token at {:?} for type {} modifiers {}",
+            position,
+            token_type,
+            token_modifiers_bitset,
+        );
     }
 
     #[test]
@@ -2340,11 +2853,7 @@ mod tests {
             "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[lib]\npath = \"mod.masm\"\nnamespace = \"app\"\n",
         )
         .unwrap();
-        fs::write(
-            root.join("mod.masm"),
-            "pub proc foo\n    call.foo\nend\n",
-        )
-        .unwrap();
+        fs::write(root.join("mod.masm"), "pub proc foo\n    call.foo\nend\n").unwrap();
 
         let snapshot = ProjectSnapshot::load_for_document(
             &root.join("mod.masm"),
@@ -2354,18 +2863,78 @@ mod tests {
         )
         .unwrap();
 
-        let definition = snapshot
-            .definition_at(&root.join("mod.masm"), Position::new(1, 9))
-            .unwrap();
+        let definition =
+            snapshot.definition_at(&root.join("mod.masm"), Position::new(1, 9)).unwrap();
         assert_eq!(definition.uri, Url::from_file_path(root.join("mod.masm")).unwrap());
 
-        let hover = snapshot
-            .hover_at(&root.join("mod.masm"), Position::new(1, 9))
-            .unwrap();
+        let hover = snapshot.hover_at(&root.join("mod.masm"), Position::new(1, 9)).unwrap();
         match hover.contents {
             HoverContents::Markup(content) => assert!(content.value.contains("proc ::app::foo")),
             _ => panic!("expected markdown hover"),
         }
+    }
+
+    #[test]
+    fn classifies_semantic_tokens_for_symbols_and_literals() {
+        let root = temp_dir("semantic-tokens");
+        fs::write(
+            root.join("miden-project.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[lib]\npath = \
+             \"mod.masm\"\nnamespace = \"app\"\n",
+        )
+        .unwrap();
+        let text = "\
+#! docs
+pub const ERR_CODE = 1
+type Value = felt
+pub proc helper(value: Value)
+    # note
+    push.ERR_CODE
+end
+";
+        fs::write(root.join("mod.masm"), text).unwrap();
+
+        let snapshot = ProjectSnapshot::load_for_document(
+            &root.join("mod.masm"),
+            &OverlayMap::default(),
+            &RegistryState::default(),
+            None,
+        )
+        .unwrap();
+
+        let tokens =
+            decode_semantic_tokens(snapshot.semantic_tokens(&root.join("mod.masm")).unwrap());
+        assert_token_at(
+            &tokens,
+            position_of(text, "#! docs"),
+            TOKEN_TYPE_COMMENT,
+            TOKEN_MODIFIER_DOCUMENTATION,
+        );
+        assert_token_at(
+            &tokens,
+            position_of(text, "ERR_CODE = 1"),
+            TOKEN_TYPE_VARIABLE,
+            TOKEN_MODIFIER_DECLARATION | TOKEN_MODIFIER_READONLY,
+        );
+        assert_token_at(
+            &tokens,
+            position_of(text, "Value = felt"),
+            TOKEN_TYPE_TYPE,
+            TOKEN_MODIFIER_DECLARATION,
+        );
+        assert_token_at(
+            &tokens,
+            position_of(text, "helper(value"),
+            TOKEN_TYPE_FUNCTION,
+            TOKEN_MODIFIER_DECLARATION,
+        );
+        assert_token_at(
+            &tokens,
+            position_after(text, "push."),
+            TOKEN_TYPE_VARIABLE,
+            TOKEN_MODIFIER_READONLY,
+        );
+        assert_token_at(&tokens, position_of(text, "# note"), TOKEN_TYPE_COMMENT, 0);
     }
 
     #[test]
@@ -2432,7 +3001,8 @@ mod tests {
              nnamespace=\"app\"\n[dependencies]\nutil.workspace=true\n",
         )
         .unwrap();
-        let app_text = "use util\npub proc main\n    call.util::helper\n    call.util::helper\nend\n";
+        let app_text =
+            "use util\npub proc main\n    call.util::helper\n    call.util::helper\nend\n";
         fs::write(app_dir.join("mod.masm"), app_text).unwrap();
 
         let snapshot = ProjectSnapshot::load_for_document(
@@ -2444,11 +3014,7 @@ mod tests {
         .unwrap();
 
         let references = snapshot
-            .references_at(
-                &util_dir.join("mod.masm"),
-                position_of(util_text, "helper"),
-                true,
-            )
+            .references_at(&util_dir.join("mod.masm"), position_of(util_text, "helper"), true)
             .unwrap();
 
         assert_eq!(references.len(), 3);
@@ -2459,11 +3025,131 @@ mod tests {
             references
                 .iter()
                 .filter(|location| {
-                    normalize_path(&location.uri.to_file_path().unwrap()) == app_dir.join("mod.masm")
+                    normalize_path(&location.uri.to_file_path().unwrap())
+                        == app_dir.join("mod.masm")
                 })
                 .count(),
             2,
         );
+    }
+
+    #[test]
+    fn renders_inlay_hints_for_resolved_call_signatures() {
+        let root = temp_dir("inlay-hints");
+        fs::write(
+            root.join("miden-project.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[lib]\npath = \
+             \"mod.masm\"\nnamespace = \"app\"\n",
+        )
+        .unwrap();
+        let text = "\
+pub proc helper(value: felt)
+    push.1
+end
+pub proc main
+    call.helper
+end
+";
+        fs::write(root.join("mod.masm"), text).unwrap();
+
+        let snapshot = ProjectSnapshot::load_for_document(
+            &root.join("mod.masm"),
+            &OverlayMap::default(),
+            &RegistryState::default(),
+            None,
+        )
+        .unwrap();
+
+        let hints = snapshot
+            .inlay_hints(
+                &root.join("mod.masm"),
+                Range::new(Position::new(0, 0), Position::new(6, 0)),
+            )
+            .unwrap();
+
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].position, position_after(text, "call.helper"));
+        match &hints[0].label {
+            InlayHintLabel::LabelParts(parts) => {
+                assert_eq!(parts.len(), 1);
+                assert!(parts[0].value.contains("(value: felt)"));
+                assert_eq!(
+                    normalize_path(
+                        &parts[0].location.as_ref().unwrap().uri.to_file_path().unwrap()
+                    ),
+                    root.join("mod.masm"),
+                );
+            }
+            _ => panic!("expected label parts"),
+        }
+    }
+
+    #[test]
+    fn emits_code_lenses_for_exports_and_entrypoints() {
+        let root = temp_dir("code-lenses");
+        let lib_dir = root.join("lib");
+        let bin_dir = root.join("bin");
+        fs::create_dir_all(&lib_dir).unwrap();
+        fs::create_dir_all(&bin_dir).unwrap();
+
+        fs::write(
+            root.join("miden-project.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[lib]\npath = \
+             \"lib/mod.masm\"\nnamespace = \"app\"\n\n[[bin]]\nname = \"cli\"\npath = \
+             \"bin/main.masm\"\n",
+        )
+        .unwrap();
+        fs::write(
+            lib_dir.join("mod.masm"),
+            "\
+pub proc exported_helper
+    push.1
+end
+
+proc internal_helper
+    push.1
+end
+",
+        )
+        .unwrap();
+        fs::write(
+            bin_dir.join("main.masm"),
+            "\
+begin
+    call.app::exported_helper
+end
+",
+        )
+        .unwrap();
+
+        let library_snapshot = ProjectSnapshot::load_for_document(
+            &lib_dir.join("mod.masm"),
+            &OverlayMap::default(),
+            &RegistryState::default(),
+            None,
+        )
+        .unwrap();
+        let library_lenses = library_snapshot.code_lenses(&lib_dir.join("mod.masm")).unwrap();
+        assert_eq!(library_lenses.len(), 1);
+        assert!(
+            library_lenses[0]
+                .command
+                .as_ref()
+                .unwrap()
+                .title
+                .contains("Exported as ::app::exported_helper")
+        );
+
+        let bin_snapshot = ProjectSnapshot::load_for_document(
+            &bin_dir.join("main.masm"),
+            &OverlayMap::default(),
+            &RegistryState::default(),
+            None,
+        )
+        .unwrap();
+        let bin_lenses = bin_snapshot.code_lenses(&bin_dir.join("main.masm")).unwrap();
+        assert_eq!(bin_lenses.len(), 1);
+        assert!(bin_lenses[0].command.as_ref().unwrap().title.starts_with("Entrypoint "));
     }
 
     #[test]
@@ -2504,35 +3190,33 @@ end
             .unwrap();
         let proc_changes = collect_changes(proc_edit);
         assert_eq!(proc_changes[&root.join("mod.masm")].len(), 2);
-        assert!(proc_changes[&root.join("mod.masm")]
-            .iter()
-            .all(|edit| edit.new_text == "renamed_helper"));
+        assert!(
+            proc_changes[&root.join("mod.masm")]
+                .iter()
+                .all(|edit| edit.new_text == "renamed_helper")
+        );
 
         let const_edit = snapshot
-            .rename_edits(
-                &root.join("mod.masm"),
-                position_of(text, "ERR_CODE"),
-                "NEW_CODE",
-            )
+            .rename_edits(&root.join("mod.masm"), position_of(text, "ERR_CODE"), "NEW_CODE")
             .unwrap();
         let const_changes = collect_changes(const_edit);
         assert_eq!(const_changes[&root.join("mod.masm")].len(), 2);
-        assert!(const_changes[&root.join("mod.masm")]
-            .iter()
-            .all(|edit| edit.new_text == "NEW_CODE"));
+        assert!(
+            const_changes[&root.join("mod.masm")]
+                .iter()
+                .all(|edit| edit.new_text == "NEW_CODE")
+        );
 
         let type_edit = snapshot
-            .rename_edits(
-                &root.join("mod.masm"),
-                position_of(text, "Value ="),
-                "Amount",
-            )
+            .rename_edits(&root.join("mod.masm"), position_of(text, "Value ="), "Amount")
             .unwrap();
         let type_changes = collect_changes(type_edit);
         assert_eq!(type_changes[&root.join("mod.masm")].len(), 2);
-        assert!(type_changes[&root.join("mod.masm")]
-            .iter()
-            .all(|edit| edit.new_text == "Amount"));
+        assert!(
+            type_changes[&root.join("mod.masm")]
+                .iter()
+                .all(|edit| edit.new_text == "Amount")
+        );
     }
 
     #[test]
