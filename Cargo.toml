@@ -1,0 +1,9 @@
+[package]
+name = "miden-lsp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tree-sitter-masm = "0.1"
+#miden-project = { path = "../miden-vm/crates/project" }
+#miden-mast-package = { path = "../miden-vm/crates/mast-package" }
