@@ -423,3 +423,224 @@ fn root_workspace_folder(root_uri: Option<Url>) -> Vec<WorkspaceFolder> {
         })
         .unwrap_or_default()
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use futures::StreamExt;
+    use serde_json::{Value, json};
+    use tokio::sync::mpsc;
+    use tower::{Service, ServiceExt};
+    use tower_lsp::{
+        LspService,
+        jsonrpc::Request,
+        lsp_types::{Hover, InitializeResult, Location, WorkspaceEdit},
+    };
+
+    use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("miden-lsp-backend-{name}-{suffix}"));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_file(path: &Path, contents: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, contents).unwrap();
+    }
+
+    async fn call(
+        service: &mut LspService<Backend>,
+        method: &'static str,
+        params: Value,
+        id: i64,
+    ) -> Value {
+        let response = service
+            .ready()
+            .await
+            .unwrap()
+            .call(Request::build(method).params(params).id(id).finish())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(response.is_ok(), "request '{}' failed: {:?}", method, response.error());
+        response.result().cloned().unwrap_or(Value::Null)
+    }
+
+    async fn notify(service: &mut LspService<Backend>, method: &'static str, params: Value) {
+        let response = service
+            .ready()
+            .await
+            .unwrap()
+            .call(Request::build(method).params(params).finish())
+            .await
+            .unwrap();
+        assert!(response.is_none(), "notification '{}' returned a response", method);
+    }
+
+    async fn next_notification(
+        socket: &mut mpsc::UnboundedReceiver<Request>,
+        method: &str,
+    ) -> Value {
+        loop {
+            let request = socket.recv().await.expect("expected a server notification");
+            if request.method() == method {
+                return request.params().cloned().unwrap_or(Value::Null);
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn serves_initialize_diagnostics_hover_definition_and_rename_end_to_end() {
+        let root = temp_dir("e2e");
+        let manifest_path = root.join("miden-project.toml");
+        let source_path = root.join("mod.masm");
+        write_file(
+            &manifest_path,
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[lib]\npath = 1\nnamespace = \
+             \"app\"\n",
+        );
+        let valid_text = "pub proc helper\n    push.1\nend\npub proc main\n    call.helper\nend\n";
+        write_file(&source_path, valid_text);
+
+        let source_uri = Url::from_file_path(&source_path).unwrap();
+        let root_uri = Url::from_file_path(&root).unwrap();
+        let (mut service, mut socket) = LspService::new(Backend::new);
+        let (tx, mut rx) = mpsc::unbounded_channel::<Request>();
+        tokio::spawn(async move {
+            while let Some(request) = socket.next().await {
+                let _ = tx.send(request);
+            }
+        });
+
+        let initialize = call(
+            &mut service,
+            "initialize",
+            json!({
+                "rootUri": root_uri,
+                "capabilities": {}
+            }),
+            1,
+        )
+        .await;
+        let initialize: InitializeResult = serde_json::from_value(initialize).unwrap();
+        assert!(initialize.capabilities.definition_provider.is_some());
+        assert!(initialize.capabilities.rename_provider.is_some());
+        assert!(initialize.capabilities.semantic_tokens_provider.is_some());
+        assert!(initialize.capabilities.inlay_hint_provider.is_some());
+        assert!(initialize.capabilities.code_lens_provider.is_some());
+
+        notify(&mut service, "initialized", json!({})).await;
+
+        notify(
+            &mut service,
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": source_uri,
+                    "languageId": "masm",
+                    "version": 1,
+                    "text": valid_text
+                }
+            }),
+        )
+        .await;
+        let diagnostics = next_notification(&mut rx, "textDocument/publishDiagnostics").await;
+        assert_eq!(diagnostics["uri"], json!(source_uri));
+        assert!(!diagnostics["diagnostics"].as_array().unwrap().is_empty());
+
+        write_file(
+            &manifest_path,
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[lib]\npath = \
+             \"mod.masm\"\nnamespace = \"app\"\n",
+        );
+
+        notify(
+            &mut service,
+            "textDocument/didChange",
+            json!({
+                "textDocument": {
+                    "uri": source_uri,
+                    "version": 2
+                },
+                "contentChanges": [
+                    {
+                        "text": valid_text
+                    }
+                ]
+            }),
+        )
+        .await;
+        let diagnostics = next_notification(&mut rx, "textDocument/publishDiagnostics").await;
+        assert_eq!(diagnostics["uri"], json!(source_uri));
+        assert!(diagnostics["diagnostics"].as_array().unwrap().is_empty());
+
+        let hover = call(
+            &mut service,
+            "textDocument/hover",
+            json!({
+                "textDocument": { "uri": source_uri },
+                "position": { "line": 4, "character": 9 }
+            }),
+            2,
+        )
+        .await;
+        let hover: Hover = serde_json::from_value(hover).unwrap();
+        match hover.contents {
+            tower_lsp::lsp_types::HoverContents::Markup(content) => {
+                assert!(content.value.contains("proc ::app::helper"))
+            }
+            _ => panic!("expected markdown hover"),
+        }
+
+        let definition = call(
+            &mut service,
+            "textDocument/definition",
+            json!({
+                "textDocument": { "uri": source_uri },
+                "position": { "line": 4, "character": 9 }
+            }),
+            3,
+        )
+        .await;
+        let definition: Location = serde_json::from_value(definition).unwrap();
+        assert_eq!(
+            normalize_path(&definition.uri.to_file_path().unwrap()),
+            normalize_path(&source_uri.to_file_path().unwrap())
+        );
+        assert_eq!(definition.range.start.line, 0);
+
+        let rename = call(
+            &mut service,
+            "textDocument/rename",
+            json!({
+                "textDocument": { "uri": source_uri },
+                "position": { "line": 0, "character": 9 },
+                "newName": "renamed_helper"
+            }),
+            4,
+        )
+        .await;
+        let rename: WorkspaceEdit = serde_json::from_value(rename).unwrap();
+        let changes = rename.changes.unwrap();
+        let edits = changes
+            .iter()
+            .find_map(|(uri, edits)| {
+                (normalize_path(&uri.to_file_path().unwrap())
+                    == normalize_path(&source_uri.to_file_path().unwrap()))
+                .then_some(edits)
+            })
+            .unwrap();
+        assert_eq!(edits.len(), 2);
+        assert!(edits.iter().all(|edit| edit.new_text == "renamed_helper"));
+    }
+}

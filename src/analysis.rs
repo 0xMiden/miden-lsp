@@ -1421,9 +1421,7 @@ fn collect_target_files(context: &TargetContext) -> Result<Vec<PathBuf>, String>
     let mut files = Vec::new();
     collect_masm_files(&context.root_dir, &mut files)?;
     files.sort();
-    if context.executable {
-        files.retain(|path| !context.sibling_exec_roots.contains(path));
-    }
+    files.retain(|path| !context.sibling_exec_roots.contains(path));
     Ok(files)
 }
 
@@ -1740,7 +1738,11 @@ fn parse_procedure(
 
     let selection_range = match name_node {
         Some(name_node) => node_range(name_node, parsed),
-        None => node_range(node, parsed),
+        None => {
+            let start = node.start_byte();
+            let end = (start + "begin".len()).min(node.end_byte());
+            byte_range_to_lsp_range(&parsed.text, &parsed.line_offsets, start..end)
+        }
     };
     let full_range = node_range(node, parsed);
     let hover = render_definition_block("proc", &path, signature.as_deref(), docs.as_deref());
@@ -2761,7 +2763,20 @@ struct ResolutionIndex {
 mod tests {
     use super::*;
     use crate::document::offset_to_position;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use miden_assembly_syntax::{
+        Library,
+        ast::{Path as AstPath, PathBuf as AstPathBuf},
+        library::{LibraryExport, ProcedureExport as LibraryProcedureExport},
+    };
+    use miden_core::{
+        mast::{BasicBlockNodeBuilder, MastForest, MastForestContributor, MastNodeExt, MastNodeId},
+        operations::Operation,
+        serde::Serializable,
+    };
+    use miden_mast_package::{
+        Package as MastPackage, PackageExport, PackageManifest,
+        ProcedureExport as PackageProcedureExport, TargetType,
+    };
     use tower_lsp::lsp_types::TextEdit;
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -2843,6 +2858,72 @@ mod tests {
             token_type,
             token_modifiers_bitset,
         );
+    }
+
+    fn write_file(path: &FsPath, contents: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, contents).unwrap();
+    }
+
+    fn run_git(dir: &FsPath, args: &[&str]) {
+        let output = Command::new("git").current_dir(dir).args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "git {} failed in '{}': {}",
+            args.join(" "),
+            dir.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn build_forest() -> (MastForest, MastNodeId) {
+        let mut forest = MastForest::new();
+        let node_id = BasicBlockNodeBuilder::new(vec![Operation::Add], Vec::new())
+            .add_to_forest(&mut forest)
+            .expect("failed to build basic block");
+        forest.make_root(node_id);
+        (forest, node_id)
+    }
+
+    fn absolute_export_path(name: &str) -> Arc<AstPath> {
+        let path = AstPathBuf::new(name).expect("invalid test path");
+        let path = path.as_path().to_absolute().into_owned();
+        Arc::from(path.into_boxed_path())
+    }
+
+    fn build_package_bytes(name: &str, version: &str, export_path: &str) -> Vec<u8> {
+        let (forest, node_id) = build_forest();
+        let path = absolute_export_path(export_path);
+        let export = LibraryProcedureExport::new(node_id, Arc::clone(&path));
+
+        let mut exports = BTreeMap::new();
+        exports.insert(Arc::clone(&path), LibraryExport::Procedure(export));
+
+        let library = Arc::new(Library::new(Arc::new(forest), exports).unwrap());
+        let digest = library.mast_forest()[node_id].digest();
+        let manifest = PackageManifest::new([PackageExport::Procedure(PackageProcedureExport {
+            path,
+            digest,
+            signature: None,
+            attributes: Default::default(),
+        })])
+        .unwrap();
+
+        let package = MastPackage {
+            name: name.into(),
+            version: version.parse().unwrap(),
+            description: None,
+            kind: TargetType::Library,
+            mast: library,
+            manifest,
+            sections: Vec::new(),
+        };
+
+        let mut bytes = Vec::new();
+        package.write_into(&mut bytes);
+        bytes
     }
 
     #[test]
@@ -3031,6 +3112,312 @@ end
                 .count(),
             2,
         );
+    }
+
+    #[test]
+    fn resolves_manifest_namespaces_and_prefers_executable_ownership_for_bin_roots() {
+        let root = temp_dir("target-ownership");
+        let asm_dir = root.join("asm");
+        fs::create_dir_all(&asm_dir).unwrap();
+
+        write_file(
+            &root.join("miden-project.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[lib]\npath = \
+             \"asm/mod.masm\"\nnamespace = \"pkg::core\"\n\n[[bin]]\nname = \"cli\"\npath = \
+             \"asm/main.masm\"\n",
+        );
+        let lib_text = "use helpers\npub proc root\n    call.helpers::helper\nend\n";
+        let helpers_text = "pub proc helper\n    push.1\nend\n";
+        let main_text = "begin\n    call.pkg::core::helpers::helper\nend\n";
+        write_file(&asm_dir.join("mod.masm"), lib_text);
+        write_file(&asm_dir.join("helpers.masm"), helpers_text);
+        write_file(&asm_dir.join("main.masm"), main_text);
+
+        let snapshot = ProjectSnapshot::load_for_document(
+            &asm_dir.join("main.masm"),
+            &OverlayMap::default(),
+            &RegistryState::default(),
+            None,
+        )
+        .unwrap();
+
+        let entrypoint_hover =
+            snapshot.hover_at(&asm_dir.join("main.masm"), Position::new(0, 1)).unwrap();
+        match entrypoint_hover.contents {
+            HoverContents::Markup(content) => assert!(
+                content.value.contains("proc ::$exec::$main"),
+                "{}",
+                content.value
+            ),
+            _ => panic!("expected markdown hover"),
+        }
+
+        let helper_hover = snapshot
+            .hover_at(&asm_dir.join("helpers.masm"), position_of(helpers_text, "helper"))
+            .unwrap();
+        match helper_hover.contents {
+            HoverContents::Markup(content) => {
+                assert!(content.value.contains("proc ::pkg::core::helpers::helper"))
+            }
+            _ => panic!("expected markdown hover"),
+        }
+
+        let definition = snapshot
+            .definition_at(
+                &asm_dir.join("main.masm"),
+                position_after(main_text, "call.pkg::core::helpers::"),
+            )
+            .unwrap();
+        assert_eq!(
+            normalize_path(&definition.uri.to_file_path().unwrap()),
+            asm_dir.join("helpers.masm")
+        );
+    }
+
+    #[test]
+    fn parses_fixture_symbols_and_resolves_multi_file_references_inside_a_package() {
+        let root = temp_dir("package-multifile");
+        let src_dir = root.join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+
+        write_file(
+            &root.join("miden-project.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[lib]\npath = \
+             \"src/mod.masm\"\nnamespace = \"app::core\"\n",
+        );
+        let main_text = "\
+use app::core::helpers->math
+const ERR = 1
+type Amount = felt
+pub proc main(value: Amount)
+    call.math::ext_helper
+    push.ERR
+end
+";
+        let helpers_text = "pub proc ext_helper\n    push.1\nend\n";
+        write_file(&src_dir.join("mod.masm"), main_text);
+        write_file(&src_dir.join("helpers.masm"), helpers_text);
+
+        let snapshot = ProjectSnapshot::load_for_document(
+            &src_dir.join("mod.masm"),
+            &OverlayMap::default(),
+            &RegistryState::default(),
+            None,
+        )
+        .unwrap();
+
+        let symbols = snapshot.document_symbols(&src_dir.join("mod.masm")).unwrap();
+        let DocumentSymbolResponse::Nested(symbols) = symbols else {
+            panic!("expected nested document symbols");
+        };
+        assert!(symbols.iter().any(|symbol| symbol.name == "ERR"));
+        assert!(symbols.iter().any(|symbol| symbol.name == "Amount"));
+        assert!(symbols.iter().any(|symbol| symbol.name == "main"));
+
+        let definition = snapshot
+            .definition_at(&src_dir.join("mod.masm"), position_after(main_text, "call.math::"))
+            .unwrap();
+        assert_eq!(
+            normalize_path(&definition.uri.to_file_path().unwrap()),
+            src_dir.join("helpers.masm")
+        );
+
+        let references = snapshot
+            .references_at(
+                &src_dir.join("helpers.masm"),
+                position_of(helpers_text, "ext_helper"),
+                true,
+            )
+            .unwrap();
+        assert_eq!(references.len(), 2);
+        assert!(references.iter().any(|location| {
+            normalize_path(&location.uri.to_file_path().unwrap()) == src_dir.join("helpers.masm")
+        }));
+        assert!(references.iter().any(|location| {
+            normalize_path(&location.uri.to_file_path().unwrap()) == src_dir.join("mod.masm")
+        }));
+    }
+
+    #[test]
+    fn resolves_path_dependency_from_source() {
+        let root = temp_dir("path-dependency");
+        let dep_dir = root.join("dep");
+        let app_dir = root.join("app");
+        fs::create_dir_all(&dep_dir).unwrap();
+        fs::create_dir_all(&app_dir).unwrap();
+
+        write_file(
+            &dep_dir.join("miden-project.toml"),
+            "[package]\nname = \"dep\"\nversion = \"0.1.0\"\n[lib]\npath = \
+             \"mod.masm\"\nnamespace = \"dep\"\n",
+        );
+        let dep_text = "pub proc helper\n    push.1\nend\n";
+        write_file(&dep_dir.join("mod.masm"), dep_text);
+
+        write_file(
+            &app_dir.join("miden-project.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[lib]\npath = \
+             \"mod.masm\"\nnamespace = \"app\"\n[dependencies]\ndep = { path = \"../dep\" }\n",
+        );
+        let app_text = "use dep\npub proc main\n    call.dep::helper\nend\n";
+        write_file(&app_dir.join("mod.masm"), app_text);
+
+        let snapshot = ProjectSnapshot::load_for_document(
+            &app_dir.join("mod.masm"),
+            &OverlayMap::default(),
+            &RegistryState::default(),
+            None,
+        )
+        .unwrap();
+
+        let definition = snapshot
+            .definition_at(&app_dir.join("mod.masm"), position_after(app_text, "call.dep::"))
+            .unwrap();
+        assert_eq!(
+            normalize_path(&definition.uri.to_file_path().unwrap()),
+            dep_dir.join("mod.masm")
+        );
+    }
+
+    #[test]
+    fn resolves_git_dependency_from_source() {
+        let root = temp_dir("git-dependency");
+        let repo_dir = root.join("repo");
+        let app_dir = root.join("app");
+        fs::create_dir_all(&repo_dir).unwrap();
+        fs::create_dir_all(&app_dir).unwrap();
+
+        write_file(
+            &repo_dir.join("miden-project.toml"),
+            "[package]\nname = \"dep\"\nversion = \"0.1.0\"\n[lib]\npath = \
+             \"mod.masm\"\nnamespace = \"dep\"\n",
+        );
+        let dep_text = "pub proc helper\n    push.1\nend\n";
+        write_file(&repo_dir.join("mod.masm"), dep_text);
+        run_git(&repo_dir, &["init", "-b", "main"]);
+        run_git(&repo_dir, &["config", "user.email", "test@example.com"]);
+        run_git(&repo_dir, &["config", "user.name", "Test"]);
+        run_git(&repo_dir, &["config", "commit.gpgsign", "false"]);
+        run_git(&repo_dir, &["add", "."]);
+        run_git(&repo_dir, &["commit", "-m", "init"]);
+
+        let repo_uri = Url::from_file_path(&repo_dir).unwrap();
+        write_file(
+            &app_dir.join("miden-project.toml"),
+            &format!(
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[lib]\npath = \
+                 \"mod.masm\"\nnamespace = \"app\"\n[dependencies]\ndep = {{ git = \"{}\", branch \
+                 = \"main\" }}\n",
+                repo_uri
+            ),
+        );
+        let app_text = "use dep\npub proc main\n    call.dep::helper\nend\n";
+        write_file(&app_dir.join("mod.masm"), app_text);
+
+        let git_cache_root = root.join("git-cache");
+        let snapshot = ProjectSnapshot::load_for_document(
+            &app_dir.join("mod.masm"),
+            &OverlayMap::default(),
+            &RegistryState::default(),
+            Some(&git_cache_root),
+        )
+        .unwrap();
+
+        let definition = snapshot
+            .definition_at(&app_dir.join("mod.masm"), position_after(app_text, "call.dep::"))
+            .unwrap();
+        let definition_path = normalize_path(&definition.uri.to_file_path().unwrap());
+        assert!(definition_path.ends_with("mod.masm"));
+        assert_ne!(definition_path, repo_dir.join("mod.masm"));
+
+        let hover = snapshot
+            .hover_at(&app_dir.join("mod.masm"), position_after(app_text, "call.dep::"))
+            .unwrap();
+        match hover.contents {
+            HoverContents::Markup(content) => assert!(content.value.contains("proc ::dep::helper")),
+            _ => panic!("expected markdown hover"),
+        }
+    }
+
+    #[test]
+    fn falls_back_to_preassembled_package_metadata_for_hover_and_definition() {
+        let root = temp_dir("preassembled-dependency");
+        let app_dir = root.join("app");
+        fs::create_dir_all(&app_dir).unwrap();
+
+        let artifact_path = root.join("dep.masp");
+        fs::write(&artifact_path, build_package_bytes("dep", "1.0.0", "dep::helper")).unwrap();
+
+        write_file(
+            &app_dir.join("miden-project.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[lib]\npath = \
+             \"mod.masm\"\nnamespace = \"app\"\n[dependencies]\ndep = { path = \"../dep.masp\" }\n",
+        );
+        let app_text = "use dep\npub proc main\n    call.dep::helper\nend\n";
+        write_file(&app_dir.join("mod.masm"), app_text);
+
+        let snapshot = ProjectSnapshot::load_for_document(
+            &app_dir.join("mod.masm"),
+            &OverlayMap::default(),
+            &RegistryState::default(),
+            None,
+        )
+        .unwrap();
+
+        let definition = snapshot
+            .definition_at(&app_dir.join("mod.masm"), position_after(app_text, "call.dep::"))
+            .unwrap();
+        assert_eq!(normalize_path(&definition.uri.to_file_path().unwrap()), artifact_path);
+
+        let hover = snapshot
+            .hover_at(&app_dir.join("mod.masm"), position_after(app_text, "call.dep::"))
+            .unwrap();
+        match hover.contents {
+            HoverContents::Markup(content) => {
+                assert!(content.value.contains("proc ::dep::helper"));
+                assert!(content.value.contains("package: dep@1.0.0"));
+            }
+            _ => panic!("expected markdown hover"),
+        }
+    }
+
+    #[test]
+    fn resolves_registry_dependency_from_in_memory_registry_artifacts() {
+        let root = temp_dir("registry-dependency");
+        let app_dir = root.join("app");
+        fs::create_dir_all(&app_dir).unwrap();
+
+        let artifact_path = root.join("registry").join("dep.masp");
+        if let Some(parent) = artifact_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&artifact_path, build_package_bytes("dep", "1.2.3", "dep::helper")).unwrap();
+        let registry = RegistryState::from_options(&InitializationOptions {
+            registry_artifacts: vec![artifact_path.clone()],
+            git_cache_root: None,
+        })
+        .unwrap();
+
+        write_file(
+            &app_dir.join("miden-project.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[lib]\npath = \
+             \"mod.masm\"\nnamespace = \"app\"\n[dependencies]\ndep = \"1.2.3\"\n",
+        );
+        let app_text = "use dep\npub proc main\n    call.dep::helper\nend\n";
+        write_file(&app_dir.join("mod.masm"), app_text);
+
+        let snapshot = ProjectSnapshot::load_for_document(
+            &app_dir.join("mod.masm"),
+            &OverlayMap::default(),
+            &registry,
+            None,
+        )
+        .unwrap();
+
+        let definition = snapshot
+            .definition_at(&app_dir.join("mod.masm"), position_after(app_text, "call.dep::"))
+            .unwrap();
+        assert_eq!(normalize_path(&definition.uri.to_file_path().unwrap()), artifact_path);
     }
 
     #[test]
