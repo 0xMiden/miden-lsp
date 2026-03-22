@@ -1587,7 +1587,9 @@ fn analyze_source_module(
     let mut cursor = parsed.tree.root_node().walk();
     for child in parsed.tree.root_node().named_children(&mut cursor) {
         match child.kind() {
-            "doc_comment" => pending_docs.push(node_text(child, &parsed.text)?.trim().to_string()),
+            "doc_comment" => {
+                pending_docs.push(normalize_doc_comment(&node_text(child, &parsed.text)?))
+            }
             "import" => {
                 parse_import(&mut module, child, parsed)?;
                 pending_docs.clear();
@@ -1623,6 +1625,17 @@ fn take_docs(pending_docs: &mut Vec<String>) -> Option<String> {
     } else {
         Some(std::mem::take(pending_docs).join("\n"))
     }
+}
+
+fn normalize_doc_comment(raw: &str) -> String {
+    raw.lines()
+        .map(|line| {
+            let trimmed = line.trim_start_matches([' ', '\t']);
+            let without_sigil = trimmed.strip_prefix("#!").unwrap_or(trimmed);
+            without_sigil.strip_prefix(' ').unwrap_or(without_sigil).to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn parse_import(
@@ -3074,6 +3087,60 @@ mod tests {
             HoverContents::Markup(content) => assert!(content.value.contains("proc ::app::foo")),
             _ => panic!("expected markdown hover"),
         }
+    }
+
+    #[test]
+    fn normalizes_doc_comments_for_hover_rendering() {
+        let root = temp_dir("doc-hover");
+        fs::write(
+            root.join("miden-project.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[lib]\npath = \
+             \"mod.masm\"\nnamespace = \"app\"\n",
+        )
+        .unwrap();
+        let text = "\
+#! Summary
+#! 
+#! Details:
+#!   - preserved indentation
+pub proc foo(a: u32) -> u32
+    push.1
+end
+
+pub proc bar
+    exec.foo
+end
+";
+        fs::write(root.join("mod.masm"), text).unwrap();
+
+        let snapshot = ProjectSnapshot::load_for_document(
+            &root.join("mod.masm"),
+            &OverlayMap::default(),
+            &RegistryState::default(),
+            None,
+        )
+        .unwrap();
+
+        let hover = snapshot
+            .hover_at(&root.join("mod.masm"), position_after(text, "exec."))
+            .unwrap();
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markdown hover");
+        };
+        assert!(content.value.contains("Summary\n\nDetails:\n  - preserved indentation"));
+        assert!(!content.value.contains("#!"));
+    }
+
+    #[test]
+    fn normalizes_doc_comment_lines_without_trimming_body_formatting() {
+        let docs = vec![
+            normalize_doc_comment("#! top line"),
+            normalize_doc_comment("#!"),
+            normalize_doc_comment("#!   indented"),
+        ]
+        .join("\n");
+
+        assert_eq!(docs, "top line\n\n  indented");
     }
 
     #[test]
