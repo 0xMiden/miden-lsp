@@ -16,16 +16,72 @@ use tower_lsp::lsp_types::{
     Diagnostic, DiagnosticSeverity, InlayHint, InlayHintKind, InlayHintLabel, MarkupContent,
     MarkupKind, Position, Range,
 };
+use tree_sitter::Node;
 
 use crate::{
     analysis::{ItemKind, ReferenceKind},
-    document::byte_range_to_lsp_range,
+    document::{byte_range_to_lsp_range, parse_text},
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StackSignature {
-    pub args: usize,
-    pub results: usize,
+    input_slots: Vec<DisplaySlot>,
+    output_slots: Vec<DisplaySlot>,
+}
+
+impl StackSignature {
+    fn new(input_slots: Vec<DisplaySlot>, output_slots: Vec<DisplaySlot>) -> Self {
+        Self {
+            input_slots,
+            output_slots,
+        }
+    }
+
+    fn args(&self) -> usize {
+        self.input_slots.len()
+    }
+
+    fn results(&self) -> usize {
+        self.output_slots.len()
+    }
+
+    fn input_values(&self) -> Vec<Value> {
+        self.input_slots
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, slot)| Value::Input(InputValue { index, slot }))
+            .collect()
+    }
+
+    fn output_values(&self) -> Vec<Value> {
+        self.output_slots.iter().cloned().map(Value::Symbolic).collect()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DisplaySlot {
+    label: String,
+    type_label: String,
+}
+
+impl DisplaySlot {
+    fn new(label: impl Into<String>, type_label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            type_label: type_label.into(),
+        }
+    }
+
+    fn felt() -> Self {
+        Self::new("felt", "felt")
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InputValue {
+    index: usize,
+    slot: DisplaySlot,
 }
 
 #[derive(Clone, Debug)]
@@ -103,6 +159,13 @@ struct StackOverlay {
 }
 
 #[derive(Clone, Debug)]
+struct RenderedOverlay {
+    hover_markdown: String,
+    inlay_label: String,
+    show_inlay: bool,
+}
+
+#[derive(Clone, Debug)]
 struct DocumentContext {
     file_path: PathBuf,
     module_path: String,
@@ -134,7 +197,8 @@ struct ConcreteEffect {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Value {
-    Input(usize),
+    Input(InputValue),
+    Symbolic(DisplaySlot),
     Unknown,
     Felt(Felt),
     Address(u32),
@@ -150,16 +214,28 @@ struct State {
 }
 
 impl State {
+    fn from_signature(signature: &StackSignature) -> Self {
+        let mut state = Self {
+            next_input: signature.input_slots.len(),
+            ..Self::default()
+        };
+        state.push_many(signature.input_values());
+        state
+    }
+
     fn ensure_depth(&mut self, depth: usize) {
         while self.stack.len() < depth {
-            self.stack.push_back(Value::Input(self.next_input));
+            self.stack.push_back(Value::Input(InputValue {
+                index: self.next_input,
+                slot: DisplaySlot::felt(),
+            }));
             self.next_input += 1;
         }
     }
 
     fn touch(&mut self, value: &Value) {
-        if let Value::Input(index) = value {
-            self.highest_input_touched = self.highest_input_touched.max(index + 1);
+        if let Value::Input(input) = value {
+            self.highest_input_touched = self.highest_input_touched.max(input.index + 1);
         }
     }
 
@@ -293,22 +369,24 @@ pub(crate) fn analyze_modules(
 pub(crate) fn signature_from_function_type(
     signature: &types::FunctionType,
 ) -> Option<StackSignature> {
-    let args = signature
+    let input_slots = signature
         .params()
         .iter()
-        .map(|ty| Some(ty.size_in_felts()))
+        .map(|ty| Some(expand_display_slots(None, &ty.to_string(), ty.size_in_felts())))
         .collect::<Option<Vec<_>>>()?
         .into_iter()
-        .sum();
-    let results = signature
+        .flatten()
+        .collect();
+    let output_slots = signature
         .results()
         .iter()
-        .map(|ty| Some(ty.size_in_felts()))
+        .map(|ty| Some(expand_display_slots(None, &ty.to_string(), ty.size_in_felts())))
         .collect::<Option<Vec<_>>>()?
         .into_iter()
-        .sum();
+        .flatten()
+        .collect();
 
-    Some(StackSignature { args, results })
+    Some(StackSignature::new(input_slots, output_slots))
 }
 
 fn parse_module_input(input: &StackModuleInput) -> Option<Vec<SourceProcedure>> {
@@ -341,15 +419,17 @@ fn parse_module_input(input: &StackModuleInput) -> Option<Vec<SourceProcedure>> 
         .types()
         .map(|decl| (decl.name().as_str().to_string(), decl.ty()))
         .collect::<BTreeMap<_, _>>();
+    let source_signatures = parse_tree_sitter_signatures(&input.text, &input.module_path);
 
     Some(
         module
             .procedures()
             .map(|procedure| SourceProcedure {
                 path: format!("{}::{}", input.module_path, procedure.name()),
-                explicit_signature: procedure
-                    .signature()
-                    .and_then(|signature| source_signature(signature, &local_types)),
+                explicit_signature: procedure.signature().and_then(|signature| {
+                    let path = format!("{}::{}", input.module_path, procedure.name());
+                    source_signature(signature, source_signatures.get(&path), &local_types)
+                }),
                 body: procedure.body().clone(),
                 document: Arc::clone(&document),
             })
@@ -357,26 +437,175 @@ fn parse_module_input(input: &StackModuleInput) -> Option<Vec<SourceProcedure>> 
     )
 }
 
+#[derive(Clone, Debug)]
+struct TreeSitterSignature {
+    params: Vec<TreeSitterSignaturePart>,
+    results: Vec<TreeSitterSignaturePart>,
+}
+
+#[derive(Clone, Debug)]
+struct TreeSitterSignaturePart {
+    name: Option<String>,
+    type_label: String,
+}
+
+fn parse_tree_sitter_signatures(
+    text: &str,
+    module_path: &str,
+) -> BTreeMap<String, TreeSitterSignature> {
+    let Ok((tree, _)) = parse_text(text) else {
+        return BTreeMap::new();
+    };
+
+    let mut signatures = BTreeMap::new();
+    let mut pending = vec![tree.root_node()];
+
+    while let Some(node) = pending.pop() {
+        if node.kind() == "procedure" {
+            let Some(name_node) = node.child_by_field_name("name") else {
+                continue;
+            };
+            let Some(name) = tree_sitter_node_text(name_node, text) else {
+                continue;
+            };
+            let path = format!("{module_path}::{name}");
+            if let Some(signature_node) = node.child_by_field_name("signature")
+                && let Some(signature) = parse_tree_sitter_signature(signature_node, text)
+            {
+                signatures.insert(path, signature);
+            }
+            continue;
+        }
+
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index as u32) {
+                pending.push(child);
+            }
+        }
+    }
+
+    signatures
+}
+
+fn parse_tree_sitter_signature(node: Node<'_>, text: &str) -> Option<TreeSitterSignature> {
+    let mut params = Vec::new();
+    let mut results = Vec::new();
+
+    for index in 0..node.named_child_count() {
+        let child = node.named_child(index as u32)?;
+        match child.kind() {
+            "function_param" => params.push(parse_tree_sitter_signature_part(child, text)?),
+            "function_results" => {
+                results = parse_tree_sitter_results(child, text).unwrap_or_default()
+            }
+            _ => {}
+        }
+    }
+
+    Some(TreeSitterSignature { params, results })
+}
+
+fn parse_tree_sitter_results(node: Node<'_>, text: &str) -> Option<Vec<TreeSitterSignaturePart>> {
+    let Some(result) = node.named_child(0) else {
+        let raw = tree_sitter_node_text(node, text)?.trim();
+        let type_label = raw.strip_prefix("->")?.trim();
+        return Some(if type_label.is_empty() {
+            Vec::new()
+        } else {
+            vec![TreeSitterSignaturePart {
+                name: None,
+                type_label: type_label.to_string(),
+            }]
+        });
+    };
+
+    match result.kind() {
+        "type_expr" => Some(vec![TreeSitterSignaturePart {
+            name: None,
+            type_label: tree_sitter_node_text(result, text)?.trim().to_string(),
+        }]),
+        "function_result_list" => {
+            let mut results = Vec::new();
+            for index in 0..result.named_child_count() {
+                let child = result.named_child(index as u32)?;
+                if child.kind() == "function_result" {
+                    results.push(parse_tree_sitter_signature_part(child, text)?);
+                }
+            }
+            Some(results)
+        }
+        _ => None,
+    }
+}
+
+fn parse_tree_sitter_signature_part(node: Node<'_>, text: &str) -> Option<TreeSitterSignaturePart> {
+    let type_node = node.child_by_field_name("type")?;
+    Some(TreeSitterSignaturePart {
+        name: node
+            .child_by_field_name("name")
+            .and_then(|name| tree_sitter_node_text(name, text))
+            .map(str::to_string),
+        type_label: tree_sitter_node_text(type_node, text)?.trim().to_string(),
+    })
+}
+
+fn tree_sitter_node_text<'a>(node: Node<'_>, text: &'a str) -> Option<&'a str> {
+    text.get(node.byte_range())
+}
+
 fn source_signature(
     signature: &AstFunctionType,
+    source_signature: Option<&TreeSitterSignature>,
     local_types: &BTreeMap<String, TypeExpr>,
 ) -> Option<StackSignature> {
-    let args = signature
-        .args
-        .iter()
-        .map(|ty| type_expr_size_in_felts(ty, local_types))
-        .collect::<Option<Vec<_>>>()?
-        .into_iter()
-        .sum();
-    let results = signature
-        .results
-        .iter()
-        .map(|ty| type_expr_size_in_felts(ty, local_types))
-        .collect::<Option<Vec<_>>>()?
-        .into_iter()
-        .sum();
+    let input_slots =
+        signature_slots(&signature.args, source_signature.map(|sig| &sig.params), local_types)?;
+    let output_slots =
+        signature_slots(&signature.results, source_signature.map(|sig| &sig.results), local_types)?;
 
-    Some(StackSignature { args, results })
+    Some(StackSignature::new(input_slots, output_slots))
+}
+
+fn signature_slots(
+    types: &[TypeExpr],
+    source_parts: Option<&Vec<TreeSitterSignaturePart>>,
+    local_types: &BTreeMap<String, TypeExpr>,
+) -> Option<Vec<DisplaySlot>> {
+    let mut slots = Vec::new();
+
+    for (index, ty) in types.iter().enumerate() {
+        let size = type_expr_size_in_felts(ty, local_types)?;
+        let source_part = source_parts.and_then(|parts| parts.get(index));
+        let type_label = source_part
+            .map(|part| part.type_label.clone())
+            .or_else(|| {
+                type_expr_to_concrete_type(ty, local_types, 0).map(|concrete| concrete.to_string())
+            })
+            .unwrap_or_else(|| "felt".to_string());
+        let base_label = source_part.and_then(|part| part.name.as_deref());
+        slots.extend(expand_display_slots(base_label, &type_label, size));
+    }
+
+    Some(slots)
+}
+
+fn expand_display_slots(
+    base_label: Option<&str>,
+    type_label: &str,
+    size: usize,
+) -> Vec<DisplaySlot> {
+    if size == 0 {
+        return Vec::new();
+    }
+
+    let base = base_label.unwrap_or(type_label);
+    if size == 1 {
+        return vec![DisplaySlot::new(base, type_label)];
+    }
+
+    (0..size)
+        .map(|index| DisplaySlot::new(format!("{base}_{index}"), type_label))
+        .collect()
 }
 
 fn type_expr_size_in_felts(
@@ -469,7 +698,12 @@ impl Analyzer {
     }
 
     fn analyze_body(&mut self, procedure: &SourceProcedure) -> CallEffect {
-        let state = match self.analyze_block(procedure, &procedure.body, State::default()) {
+        let initial_state = procedure
+            .explicit_signature
+            .as_ref()
+            .map(State::from_signature)
+            .unwrap_or_default();
+        let state = match self.analyze_block(procedure, &procedure.body, initial_state) {
             Some(state) => state,
             None => return CallEffect::Indeterminate,
         };
@@ -478,11 +712,13 @@ impl Analyzer {
         let values = state.stack.into_iter().collect::<Vec<_>>();
         let tail_start = values
             .iter()
-            .position(|value| matches!(value, Value::Input(index) if *index == required_inputs))
+            .position(
+                |value| matches!(value, Value::Input(input) if input.index == required_inputs),
+            )
             .unwrap_or(values.len());
 
         if values[tail_start..].iter().enumerate().any(|(offset, value)| {
-            !matches!(value, Value::Input(index) if *index == required_inputs + offset)
+            !matches!(value, Value::Input(input) if input.index == required_inputs + offset)
         }) {
             return CallEffect::Indeterminate;
         }
@@ -517,13 +753,15 @@ impl Analyzer {
                     state: next,
                     overlay,
                 } => {
+                    let rendered =
+                        overlay.render(Some(&next), procedure.explicit_signature.is_some());
                     self.push_overlay(
                         &procedure.document.file_path,
                         StackOverlay {
                             range,
-                            hover_markdown: overlay.hover_markdown,
-                            inlay_label: overlay.inlay_label,
-                            show_inlay: overlay.show_inlay,
+                            hover_markdown: rendered.hover_markdown,
+                            inlay_label: rendered.inlay_label,
+                            show_inlay: rendered.show_inlay,
                         },
                     );
                     state = next;
@@ -535,13 +773,14 @@ impl Analyzer {
                     if let Some(diagnostic) = diagnostic {
                         self.push_diagnostic(&procedure.document.file_path, diagnostic);
                     }
+                    let rendered = overlay.render(None, false);
                     self.push_overlay(
                         &procedure.document.file_path,
                         StackOverlay {
                             range,
-                            hover_markdown: overlay.hover_markdown,
-                            inlay_label: overlay.inlay_label,
-                            show_inlay: overlay.show_inlay,
+                            hover_markdown: rendered.hover_markdown,
+                            inlay_label: rendered.inlay_label,
+                            show_inlay: rendered.show_inlay,
                         },
                     );
                     return None;
@@ -866,12 +1105,12 @@ impl Analyzer {
 
         match self.effective_call_effect(&path) {
             CallEffect::Counts(signature) => {
-                let _ = state.pop_many(signature.args);
-                state.push_many((0..signature.results).map(|_| Value::Unknown));
+                let _ = state.pop_many(signature.args());
+                state.push_many(signature.output_values());
                 StepResult::continue_with(
                     state.clone(),
-                    signature.args,
-                    signature.results,
+                    signature.args(),
+                    signature.results(),
                     &format!("resolved call `{path}`"),
                 )
             }
@@ -903,12 +1142,12 @@ impl Analyzer {
         {
             return match self.effective_call_effect(&path) {
                 CallEffect::Counts(signature) => {
-                    let _ = state.pop_many(signature.args);
-                    state.push_many((0..signature.results).map(|_| Value::Unknown));
+                    let _ = state.pop_many(signature.args());
+                    state.push_many(signature.output_values());
                     StepResult::continue_with_highlight(
                         state.clone(),
-                        signature.args + 1,
-                        signature.results,
+                        signature.args() + 1,
+                        signature.results(),
                         &format!("resolved `{instruction}` via `procref`"),
                     )
                 }
@@ -952,7 +1191,7 @@ impl Analyzer {
                 let outputs = preserve_inputs
                     .into_iter()
                     .map(|index| inputs.get(index).cloned().unwrap_or(Value::Unknown))
-                    .chain((0..pushed.saturating_sub(preserved)).map(|_| Value::Unknown))
+                    .chain(generic_output_values(instruction, pushed.saturating_sub(preserved)))
                     .collect::<Vec<_>>();
                 state.push_many(outputs);
                 StepResult::continue_with(
@@ -1016,7 +1255,7 @@ impl Analyzer {
 
 fn substitute_inputs(value: Value, inputs: &[Value]) -> Value {
     match value {
-        Value::Input(index) => inputs.get(index).cloned().unwrap_or(Value::Unknown),
+        Value::Input(input) => inputs.get(input.index).cloned().unwrap_or(Value::Unknown),
         other => other,
     }
 }
@@ -1052,7 +1291,7 @@ fn known_address(value: &Value) -> Option<u32> {
             let value = value.as_canonical_u64();
             (value <= u32::MAX as u64).then_some(value as u32)
         }
-        Value::Input(_) | Value::Unknown | Value::ProcRef { .. } => None,
+        Value::Input(_) | Value::Symbolic(_) | Value::Unknown | Value::ProcRef { .. } => None,
     }
 }
 
@@ -1247,36 +1486,115 @@ impl StepResult {
 
 #[derive(Clone, Debug)]
 struct OverlayInfo {
-    hover_markdown: String,
-    inlay_label: String,
-    show_inlay: bool,
+    detail: String,
+    kind: OverlayKind,
 }
 
 impl OverlayInfo {
     fn effect(popped: usize, pushed: usize, detail: &str) -> Self {
-        let felt_in = if popped == 1 { "felt" } else { "felts" };
-        let felt_out = if pushed == 1 { "felt" } else { "felts" };
         Self {
-            hover_markdown: format!(
-                "**Stack Effect**\n\nConsumes `{popped}` {felt_in} and produces `{pushed}` \
-                 {felt_out}.\n\n{detail}"
-            ),
-            inlay_label: format!("[{popped}->{pushed}]"),
-            show_inlay: false,
+            detail: detail.to_string(),
+            kind: OverlayKind::Effect {
+                popped,
+                pushed,
+                show_inlay: false,
+            },
         }
     }
 
     fn highlighted_effect(popped: usize, pushed: usize, detail: &str) -> Self {
-        let mut overlay = Self::effect(popped, pushed, detail);
-        overlay.show_inlay = true;
-        overlay
+        Self {
+            detail: detail.to_string(),
+            kind: OverlayKind::Effect {
+                popped,
+                pushed,
+                show_inlay: true,
+            },
+        }
     }
 
     fn undetermined(message: &str) -> Self {
         Self {
-            hover_markdown: format!("**Stack Effect**\n\n{message}"),
-            inlay_label: "[?]".to_string(),
-            show_inlay: true,
+            detail: message.to_string(),
+            kind: OverlayKind::Undetermined,
+        }
+    }
+
+    fn render(&self, state: Option<&State>, typed_stack_state: bool) -> RenderedOverlay {
+        match &self.kind {
+            OverlayKind::Effect { .. } if typed_stack_state => {
+                let stack_label = format_stack_state(state.expect("state is required for effects"));
+                RenderedOverlay {
+                    hover_markdown: format!(
+                        "**Operand Stack**\n\n`{stack_label}`\n\nAfter {}.",
+                        self.detail
+                    ),
+                    inlay_label: stack_label,
+                    show_inlay: true,
+                }
+            }
+            OverlayKind::Effect {
+                popped,
+                pushed,
+                show_inlay,
+            } => {
+                let felt_in = if *popped == 1 { "felt" } else { "felts" };
+                let felt_out = if *pushed == 1 { "felt" } else { "felts" };
+                RenderedOverlay {
+                    hover_markdown: format!(
+                        "**Stack Effect**\n\nConsumes `{popped}` {felt_in} and produces \
+                         `{pushed}` {felt_out}.\n\n{}",
+                        self.detail
+                    ),
+                    inlay_label: format!("[{popped}->{pushed}]"),
+                    show_inlay: *show_inlay,
+                }
+            }
+            OverlayKind::Undetermined => RenderedOverlay {
+                hover_markdown: format!("**Stack Effect**\n\n{}", self.detail),
+                inlay_label: "[?]".to_string(),
+                show_inlay: true,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum OverlayKind {
+    Effect {
+        popped: usize,
+        pushed: usize,
+        show_inlay: bool,
+    },
+    Undetermined,
+}
+
+fn format_stack_state(state: &State) -> String {
+    const MAX_RENDERED_STACK_SLOTS: usize = 16;
+
+    let mut labels = state
+        .stack
+        .iter()
+        .take(MAX_RENDERED_STACK_SLOTS)
+        .map(render_stack_value)
+        .collect::<Vec<_>>();
+    if state.stack.len() > MAX_RENDERED_STACK_SLOTS {
+        labels.push("..".to_string());
+    }
+
+    format!("[{}]", labels.join(", "))
+}
+
+fn render_stack_value(value: &Value) -> String {
+    match value {
+        Value::Input(input) => input.slot.label.clone(),
+        Value::Symbolic(slot) => slot.label.clone(),
+        Value::Unknown => "felt".to_string(),
+        Value::Felt(value) => value.to_string(),
+        Value::Address(address) => format!("@{address}"),
+        Value::ProcRef { path, index } => {
+            let name = path.rsplit("::").next().unwrap_or("procref");
+            format!("{name}_{index}")
         }
     }
 }
@@ -1289,6 +1607,56 @@ enum GenericEffect {
         preserve_inputs: Vec<usize>,
     },
     Unsupported,
+}
+
+fn generic_output_values(instruction: &Instruction, count: usize) -> Vec<Value> {
+    let slots = match instruction {
+        Instruction::U32WrappingAdd
+        | Instruction::U32WrappingSub
+        | Instruction::U32WrappingMul
+        | Instruction::U32WrappingAddImm(_)
+        | Instruction::U32WrappingSubImm(_)
+        | Instruction::U32WrappingMulImm(_)
+        | Instruction::U32WrappingAdd3
+        | Instruction::U32And
+        | Instruction::U32Or
+        | Instruction::U32Xor
+        | Instruction::U32Min
+        | Instruction::U32Max
+        | Instruction::U32Cast
+        | Instruction::U32Not
+        | Instruction::U32ShrImm(_)
+        | Instruction::U32ShlImm(_)
+        | Instruction::U32RotrImm(_)
+        | Instruction::U32RotlImm(_)
+        | Instruction::U32Popcnt
+        | Instruction::U32Ctz
+        | Instruction::U32Clz
+        | Instruction::U32Clo
+        | Instruction::U32Cto => vec![DisplaySlot::new("u32", "u32")],
+        Instruction::U32OverflowingAdd
+        | Instruction::U32OverflowingSub
+        | Instruction::U32OverflowingAddImm(_)
+        | Instruction::U32OverflowingSubImm(_) => {
+            vec![DisplaySlot::new("u32", "u32"), DisplaySlot::felt()]
+        }
+        Instruction::U32WideningAdd
+        | Instruction::U32WideningMul
+        | Instruction::U32WideningAddImm(_)
+        | Instruction::U32WideningMulImm(_)
+        | Instruction::U32WideningAdd3 => expand_display_slots(None, "u64", 2),
+        Instruction::U32Div
+        | Instruction::U32Mod
+        | Instruction::U32DivMod
+        | Instruction::U32DivImm(_)
+        | Instruction::U32ModImm(_)
+        | Instruction::U32DivModImm(_) => {
+            vec![DisplaySlot::new("u32", "u32"), DisplaySlot::new("u32", "u32")]
+        }
+        _ => (0..count).map(|_| DisplaySlot::felt()).collect(),
+    };
+
+    slots.into_iter().take(count).map(Value::Symbolic).collect()
 }
 
 fn generic_effect(instruction: &Instruction) -> GenericEffect {
@@ -1420,83 +1788,83 @@ fn generic_effect(instruction: &Instruction) -> GenericEffect {
             preserve_inputs: vec![],
         },
         Dup0 => Transform {
-            popped: 0,
+            popped: 1,
             pushed: 2,
             preserve_inputs: vec![0, 0],
         },
         Dup1 => Transform {
-            popped: 0,
+            popped: 2,
             pushed: 3,
             preserve_inputs: vec![1, 0, 1],
         },
         Dup2 => Transform {
-            popped: 0,
+            popped: 3,
             pushed: 4,
             preserve_inputs: vec![2, 0, 1, 2],
         },
         Dup3 => Transform {
-            popped: 0,
+            popped: 4,
             pushed: 5,
             preserve_inputs: vec![3, 0, 1, 2, 3],
         },
         Dup4 => Transform {
-            popped: 0,
+            popped: 5,
             pushed: 6,
             preserve_inputs: vec![4, 0, 1, 2, 3, 4],
         },
         Dup5 => Transform {
-            popped: 0,
+            popped: 6,
             pushed: 7,
             preserve_inputs: vec![5, 0, 1, 2, 3, 4, 5],
         },
         Dup6 => Transform {
-            popped: 0,
+            popped: 7,
             pushed: 8,
             preserve_inputs: vec![6, 0, 1, 2, 3, 4, 5, 6],
         },
         Dup7 => Transform {
-            popped: 0,
+            popped: 8,
             pushed: 9,
             preserve_inputs: vec![7, 0, 1, 2, 3, 4, 5, 6, 7],
         },
         Dup8 => Transform {
-            popped: 0,
+            popped: 9,
             pushed: 10,
             preserve_inputs: vec![8, 0, 1, 2, 3, 4, 5, 6, 7, 8],
         },
         Dup9 => Transform {
-            popped: 0,
-            pushed: 10,
+            popped: 10,
+            pushed: 11,
             preserve_inputs: vec![9, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
         },
         Dup10 => Transform {
-            popped: 0,
-            pushed: 11,
+            popped: 11,
+            pushed: 12,
             preserve_inputs: vec![10, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
         },
         Dup11 => Transform {
-            popped: 0,
-            pushed: 12,
+            popped: 12,
+            pushed: 13,
             preserve_inputs: vec![11, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
         },
         Dup12 => Transform {
-            popped: 0,
-            pushed: 13,
+            popped: 13,
+            pushed: 14,
             preserve_inputs: vec![12, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
         },
         Dup13 => Transform {
-            popped: 0,
-            pushed: 14,
+            popped: 14,
+            pushed: 15,
             preserve_inputs: vec![13, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
         },
         Dup14 => Transform {
-            popped: 0,
-            pushed: 15,
+            popped: 15,
+            pushed: 16,
             preserve_inputs: vec![14, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
         },
         Dup15 => Transform {
-            popped: 0,
-            pushed: 16,
+            popped: 16,
+            pushed: 17,
             preserve_inputs: vec![15, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
         },
         Swap1 => Transform {

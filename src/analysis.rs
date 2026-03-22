@@ -746,9 +746,18 @@ impl ProjectSnapshot {
         let module = pick_primary_module(modules)?;
 
         let mut hints = Vec::new();
+        let stack_hints = self
+            .stack_analysis_by_file
+            .get(&document_path)
+            .map(|analysis| analysis.inlay_hints(visible_range))
+            .unwrap_or_default();
+        let occupied_positions =
+            stack_hints.iter().map(|hint| hint.position).collect::<BTreeSet<_>>();
+
         for occurrence in &module.resolved_occurrences {
             if occurrence.kind != ReferenceKind::Invoke
                 || !ranges_overlap(occurrence.range, visible_range)
+                || occupied_positions.contains(&occurrence.range.end)
             {
                 continue;
             }
@@ -787,9 +796,7 @@ impl ProjectSnapshot {
             });
         }
 
-        if let Some(stack_analysis) = self.stack_analysis_by_file.get(&document_path) {
-            hints.extend(stack_analysis.inlay_hints(visible_range));
-        }
+        hints.extend(stack_hints);
 
         Some(hints)
     }
@@ -3000,6 +3007,15 @@ mod tests {
         fs::write(path, contents).unwrap();
     }
 
+    fn inlay_label_text(label: &InlayHintLabel) -> String {
+        match label {
+            InlayHintLabel::String(value) => value.clone(),
+            InlayHintLabel::LabelParts(parts) => {
+                parts.iter().map(|part| part.value.as_str()).collect::<String>()
+            }
+        }
+    }
+
     fn run_git(dir: &FsPath, args: &[&str]) {
         let output = Command::new("git").current_dir(dir).args(args).output().unwrap();
         assert!(
@@ -3690,9 +3706,12 @@ end
             )
             .unwrap();
 
-        assert_eq!(hints.len(), 1);
-        assert_eq!(hints[0].position, position_after(text, "call.helper"));
-        match &hints[0].label {
+        let call_hints = hints
+            .iter()
+            .filter(|hint| hint.position == position_after(text, "call.helper"))
+            .collect::<Vec<_>>();
+        assert_eq!(call_hints.len(), 1);
+        match &call_hints[0].label {
             InlayHintLabel::LabelParts(parts) => {
                 assert_eq!(parts.len(), 1);
                 assert!(parts[0].value.contains("(value: felt)"));
@@ -3732,6 +3751,143 @@ end
             panic!("expected markdown hover");
         };
         assert!(content.value.contains("Consumes `2` felts and produces `1` felt"));
+    }
+
+    #[test]
+    fn renders_typed_stack_state_inlays_for_signed_procedures() {
+        let root = temp_dir("typed-stack-inlays");
+        fs::write(
+            root.join("miden-project.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[lib]\npath = \
+             \"mod.masm\"\nnamespace = \"app\"\n",
+        )
+        .unwrap();
+        let text = "\
+proc collapse(flag: felt, a: u32, b: u64) -> u64
+    drop
+end
+
+pub proc main(a: u32, b: u64) -> u64
+    push.0
+    call.collapse
+end
+";
+        fs::write(root.join("mod.masm"), text).unwrap();
+
+        let snapshot = ProjectSnapshot::load_for_document(
+            &root.join("mod.masm"),
+            &OverlayMap::default(),
+            &RegistryState::default(),
+            None,
+        )
+        .unwrap();
+
+        let hints = snapshot
+            .inlay_hints(
+                &root.join("mod.masm"),
+                Range::new(Position::new(0, 0), Position::new(8, 0)),
+            )
+            .unwrap();
+        let labels = hints
+            .iter()
+            .map(|hint| (hint.position, inlay_label_text(&hint.label).trim().to_string()))
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(
+            labels.get(&position_after(text, "push.0")).map(String::as_str),
+            Some("[0, a, b_0, b_1]"),
+        );
+        assert_eq!(
+            labels.get(&position_after(text, "call.collapse")).map(String::as_str),
+            Some("[u64_0, u64_1]"),
+        );
+
+        let hover = snapshot
+            .hover_at(&root.join("mod.masm"), position_of(text, "call.collapse"))
+            .unwrap();
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markdown hover");
+        };
+        assert!(content.value.contains("[u64_0, u64_1]"));
+    }
+
+    #[test]
+    fn truncates_typed_stack_state_inlays_beyond_sixteen_slots() {
+        let root = temp_dir("typed-stack-truncation");
+        fs::write(
+            root.join("miden-project.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[lib]\npath = \
+             \"mod.masm\"\nnamespace = \"app\"\n",
+        )
+        .unwrap();
+        let params = (0..17).map(|index| format!("a{index}: felt")).collect::<Vec<_>>().join(", ");
+        let text = format!("pub proc main({params})\n    nop\nend\n",);
+        fs::write(root.join("mod.masm"), &text).unwrap();
+
+        let snapshot = ProjectSnapshot::load_for_document(
+            &root.join("mod.masm"),
+            &OverlayMap::default(),
+            &RegistryState::default(),
+            None,
+        )
+        .unwrap();
+
+        let hints = snapshot
+            .inlay_hints(
+                &root.join("mod.masm"),
+                Range::new(Position::new(0, 0), Position::new(3, 0)),
+            )
+            .unwrap();
+        let label = hints
+            .iter()
+            .find(|hint| hint.position == position_after(&text, "nop"))
+            .map(|hint| inlay_label_text(&hint.label))
+            .expect("missing typed stack-state inlay")
+            .trim()
+            .to_string();
+
+        assert!(label.starts_with("[a0, a1, a2"));
+        assert!(label.contains("a15"));
+        assert!(label.contains(".."));
+        assert!(!label.contains("a16"));
+    }
+
+    #[test]
+    fn preserves_typed_provenance_through_dup_inlays() {
+        let root = temp_dir("typed-stack-dup");
+        fs::write(
+            root.join("miden-project.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[lib]\npath = \
+             \"mod.masm\"\nnamespace = \"app\"\n",
+        )
+        .unwrap();
+        let text = "\
+pub proc main(p: felt, len: u32)
+    dup.1
+end
+";
+        fs::write(root.join("mod.masm"), text).unwrap();
+
+        let snapshot = ProjectSnapshot::load_for_document(
+            &root.join("mod.masm"),
+            &OverlayMap::default(),
+            &RegistryState::default(),
+            None,
+        )
+        .unwrap();
+
+        let hints = snapshot
+            .inlay_hints(
+                &root.join("mod.masm"),
+                Range::new(Position::new(0, 0), Position::new(4, 0)),
+            )
+            .unwrap();
+        let labels = hints
+            .iter()
+            .map(|hint| inlay_label_text(&hint.label).trim().to_string())
+            .collect::<Vec<_>>();
+
+        assert!(labels.iter().any(|label| label == "[len, p, len]"));
     }
 
     #[test]
