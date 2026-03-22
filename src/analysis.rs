@@ -32,9 +32,15 @@ use tower_lsp::lsp_types::{
 };
 use tree_sitter::{Node, Tree};
 
-use crate::document::{
-    byte_range_to_lsp_range, compute_line_offsets, offset_to_position, parse_text,
-    position_to_offset,
+use crate::{
+    document::{
+        byte_range_to_lsp_range, compute_line_offsets, offset_to_position, parse_text,
+        position_to_offset,
+    },
+    stack_effect::{
+        StackCallableDefinition, StackDocumentAnalysis, StackModuleInput, StackResolvedReference,
+        StackSignature, analyze_modules, signature_from_function_type,
+    },
 };
 
 type OverlayMap = BTreeMap<PathBuf, String>;
@@ -125,14 +131,14 @@ impl RegistryState {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct ContextKey {
+pub(crate) struct ContextKey {
     package: String,
     target: String,
     executable: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum ItemKind {
+pub(crate) enum ItemKind {
     Module,
     Procedure,
     Constant,
@@ -140,7 +146,7 @@ enum ItemKind {
 }
 
 #[derive(Clone, Debug)]
-enum DefinitionLocation {
+pub(crate) enum DefinitionLocation {
     Source {
         path: PathBuf,
         selection_range: Range,
@@ -151,7 +157,7 @@ enum DefinitionLocation {
 }
 
 #[derive(Clone, Debug)]
-struct Definition {
+pub(crate) struct Definition {
     context: ContextKey,
     path: String,
     module_path: String,
@@ -160,6 +166,7 @@ struct Definition {
     symbol_kind: SymbolKind,
     hover: String,
     signature: Option<String>,
+    stack_signature: Option<StackSignature>,
     location: Option<DefinitionLocation>,
     editable: bool,
     exported: bool,
@@ -211,7 +218,7 @@ struct ImportAlias {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum ReferenceKind {
+pub(crate) enum ReferenceKind {
     Invoke,
     ImportAlias,
     ImportTarget,
@@ -227,21 +234,21 @@ struct RawOccurrence {
 }
 
 #[derive(Clone, Debug)]
-struct ResolvedOccurrence {
+pub(crate) struct ResolvedOccurrence {
     range: Range,
     kind: ReferenceKind,
     definitions: Vec<usize>,
 }
 
 #[derive(Clone, Debug)]
-struct ParsedFile {
+pub(crate) struct ParsedFile {
     text: String,
     line_offsets: Vec<usize>,
     tree: Tree,
 }
 
 #[derive(Clone, Debug)]
-struct ModuleAnalysis {
+pub(crate) struct ModuleAnalysis {
     context: ContextKey,
     file_path: PathBuf,
     module_path: String,
@@ -290,6 +297,7 @@ pub struct ProjectSnapshot {
     definitions: Vec<Definition>,
     definitions_by_context: BTreeMap<ContextKey, BTreeMap<String, Vec<usize>>>,
     public_definitions: BTreeMap<String, Vec<usize>>,
+    stack_analysis_by_file: BTreeMap<PathBuf, StackDocumentAnalysis>,
 }
 
 impl ProjectSnapshot {
@@ -364,10 +372,10 @@ impl ProjectSnapshot {
         ordered.sort_by_key(|module| module.priority);
         for module in ordered {
             for definition in &module.definitions {
-                if contains_position(definition.selection_range, position) {
-                    if let Some(location) = definition.location() {
-                        return Some(location);
-                    }
+                if contains_position(definition.selection_range, position)
+                    && let Some(location) = definition.location()
+                {
+                    return Some(location);
                 }
             }
 
@@ -390,13 +398,17 @@ impl ProjectSnapshot {
     pub fn hover_at(&self, document_path: &FsPath, position: Position) -> Option<Hover> {
         let document_path = normalize_path(document_path);
         let modules = self.modules_by_file.get(&document_path)?;
+        let stack_hover = self
+            .stack_analysis_by_file
+            .get(&document_path)
+            .and_then(|analysis| analysis.hover_markdown_at(position));
 
         let mut ordered = modules.iter().collect::<Vec<_>>();
         ordered.sort_by_key(|module| module.priority);
         for module in ordered {
             for definition in &module.definitions {
                 if contains_position(definition.selection_range, position) {
-                    return Some(render_hover(definition));
+                    return Some(merge_hover(render_hover(definition), stack_hover.clone()));
                 }
             }
 
@@ -405,12 +417,18 @@ impl ProjectSnapshot {
                     && let Some(definition) =
                         occurrence.definitions.iter().find_map(|index| self.definitions.get(*index))
                 {
-                    return Some(render_hover(definition));
+                    return Some(merge_hover(render_hover(definition), stack_hover.clone()));
                 }
             }
         }
 
-        None
+        stack_hover.map(|(range, markdown)| Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: markdown,
+            }),
+            range: Some(range),
+        })
     }
 
     pub fn references_at(
@@ -769,7 +787,19 @@ impl ProjectSnapshot {
             });
         }
 
+        if let Some(stack_analysis) = self.stack_analysis_by_file.get(&document_path) {
+            hints.extend(stack_analysis.inlay_hints(visible_range));
+        }
+
         Some(hints)
+    }
+
+    pub fn semantic_diagnostics(&self, document_path: &FsPath) -> Vec<Diagnostic> {
+        let document_path = normalize_path(document_path);
+        self.stack_analysis_by_file
+            .get(&document_path)
+            .map(|analysis| analysis.diagnostics().to_vec())
+            .unwrap_or_default()
     }
 
     pub fn code_lenses(&self, document_path: &FsPath) -> Option<Vec<CodeLens>> {
@@ -1299,7 +1329,61 @@ fn build_snapshot(
         modules.sort_by_key(|module| module.priority);
     }
 
+    snapshot.stack_analysis_by_file = build_stack_analysis_by_file(&snapshot);
+
     Ok(snapshot)
+}
+
+fn build_stack_analysis_by_file(
+    snapshot: &ProjectSnapshot,
+) -> BTreeMap<PathBuf, StackDocumentAnalysis> {
+    let modules = snapshot
+        .modules_by_file
+        .values()
+        .filter_map(|modules| pick_primary_module(modules))
+        .map(|module| {
+            let parsed = snapshot.parsed_files.get(&module.file_path)?;
+
+            Some(StackModuleInput {
+                file_path: module.file_path.clone(),
+                module_path: module.module_path.clone(),
+                text: parsed.text.clone(),
+                line_offsets: parsed.line_offsets.clone(),
+                executable_root: module.context.executable
+                    && module.definitions.iter().any(|definition| definition.entrypoint),
+                resolved_references: module
+                    .resolved_occurrences
+                    .iter()
+                    .filter(|occurrence| matches!(occurrence.kind, ReferenceKind::Invoke))
+                    .map(|occurrence| StackResolvedReference {
+                        range: occurrence.range,
+                        kind: occurrence.kind.clone(),
+                        definition_indexes: occurrence.definitions.clone(),
+                    })
+                    .collect(),
+            })
+        })
+        .collect::<Option<Vec<_>>>()
+        .unwrap_or_default();
+
+    let callables = snapshot
+        .definitions
+        .iter()
+        .enumerate()
+        .filter(|(_, definition)| matches!(definition.kind, ItemKind::Procedure))
+        .map(|(index, definition)| {
+            (
+                index,
+                StackCallableDefinition {
+                    path: definition.path.clone(),
+                    kind: definition.kind.clone(),
+                    signature: definition.stack_signature.clone(),
+                },
+            )
+        })
+        .collect();
+
+    analyze_modules(&modules, callables)
 }
 
 #[derive(Clone, Debug)]
@@ -1408,13 +1492,7 @@ fn count_context_files(contexts: &[TargetContext]) -> Result<BTreeMap<PathBuf, u
 
 fn primary_priority(context: &str, file_path: &FsPath, counts: &BTreeMap<PathBuf, usize>) -> usize {
     let shared = counts.get(file_path).copied().unwrap_or_default() > 1;
-    if !shared {
-        0
-    } else if context == "lib" {
-        0
-    } else {
-        1
-    }
+    if !shared || context == "lib" { 0 } else { 1 }
 }
 
 fn collect_target_files(context: &TargetContext) -> Result<Vec<PathBuf>, String> {
@@ -1488,6 +1566,7 @@ fn analyze_source_module(
         hover: format!("```masm\nmodule {module_path}\n```"),
         kind: ItemKind::Module,
         signature: None,
+        stack_signature: None,
         location: Some(DefinitionLocation::Source {
             path: file_path.to_path_buf(),
             selection_range: module_selection,
@@ -1622,6 +1701,7 @@ fn parse_constant(
         hover,
         kind: ItemKind::Constant,
         signature: None,
+        stack_signature: None,
         location: Some(DefinitionLocation::Source {
             path: module.file_path.clone(),
             selection_range,
@@ -1679,6 +1759,7 @@ fn parse_type_definition(
         hover,
         kind: ItemKind::Type,
         signature: None,
+        stack_signature: None,
         location: Some(DefinitionLocation::Source {
             path: module.file_path.clone(),
             selection_range,
@@ -1755,6 +1836,7 @@ fn parse_procedure(
         hover,
         kind: ItemKind::Procedure,
         signature: signature.clone(),
+        stack_signature: None,
         location: Some(DefinitionLocation::Source {
             path: module.file_path.clone(),
             selection_range,
@@ -2075,6 +2157,12 @@ fn index_metadata_package(
             hover,
             kind,
             signature,
+            stack_signature: match export {
+                PackageExport::Procedure(ProcedureExport { signature, .. }) => {
+                    signature.as_ref().and_then(signature_from_function_type)
+                }
+                PackageExport::Constant(_) | PackageExport::Type(_) => None,
+            },
             location: location.clone(),
             editable: false,
             exported: true,
@@ -2119,6 +2207,7 @@ fn index_metadata_package(
             hover: format!("```masm\nmodule {module_path}\n```"),
             kind: ItemKind::Module,
             signature: None,
+            stack_signature: None,
             location: Some(location),
             editable: false,
             exported: true,
@@ -2373,7 +2462,7 @@ fn extract_completion_query(text: &str, position: Position) -> Option<Completion
         scan_left_while(text, segment_start, |ch| is_completion_ident_char(ch) || ch == ':');
     let path_prefix = text.get(path_start..segment_start)?;
 
-    let procedures_only = if path_start > 0 && text[..path_start].chars().next_back() == Some('.') {
+    let procedures_only = if path_start > 0 && text[..path_start].ends_with('.') {
         let kind_end = path_start - 1;
         let kind_start = scan_left_while(text, kind_end, is_completion_ident_char);
         matches!(text.get(kind_start..kind_end), Some("call" | "exec" | "syscall" | "procref"))
@@ -2522,6 +2611,30 @@ fn render_hover(definition: &Definition) -> Hover {
             value: definition.hover.clone(),
         }),
         range: Some(definition.selection_range),
+    }
+}
+
+fn merge_hover(base: Hover, stack_hover: Option<(Range, String)>) -> Hover {
+    let Some((stack_range, stack_markdown)) = stack_hover else {
+        return base;
+    };
+
+    let HoverContents::Markup(content) = base.contents else {
+        return Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: stack_markdown,
+            }),
+            range: Some(stack_range),
+        };
+    };
+
+    Hover {
+        contents: HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: format!("{}\n\n---\n\n{}", content.value, stack_markdown),
+        }),
+        range: Some(base.range.unwrap_or(stack_range)),
     }
 }
 
@@ -2761,8 +2874,12 @@ struct ResolutionIndex {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::document::offset_to_position;
+    use std::{
+        process::Command,
+        sync::Arc,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
     use miden_assembly_syntax::{
         Library,
         ast::{Path as AstPath, PathBuf as AstPathBuf},
@@ -2778,6 +2895,9 @@ mod tests {
         ProcedureExport as PackageProcedureExport, TargetType,
     };
     use tower_lsp::lsp_types::TextEdit;
+
+    use super::*;
+    use crate::document::offset_to_position;
 
     fn temp_dir(name: &str) -> PathBuf {
         let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
@@ -2931,7 +3051,8 @@ mod tests {
         let root = temp_dir("local-def");
         fs::write(
             root.join("miden-project.toml"),
-            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[lib]\npath = \"mod.masm\"\nnamespace = \"app\"\n",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[lib]\npath = \
+             \"mod.masm\"\nnamespace = \"app\"\n",
         )
         .unwrap();
         fs::write(root.join("mod.masm"), "pub proc foo\n    call.foo\nend\n").unwrap();
@@ -3028,18 +3149,37 @@ end
 
         fs::write(
             root.join("miden-project.toml"),
-            "[workspace]\nmembers=[\"util\",\"app\"]\n[workspace.package]\nversion=\"0.1.0\"\n",
+            r#"[workspace]
+members = ["util", "app"]
+
+[workspace.package]
+version = "0.1.0"
+"#,
         )
         .unwrap();
         fs::write(
             util_dir.join("miden-project.toml"),
-            "[package]\nname=\"util\"\nversion.workspace=true\n[lib]\npath=\"mod.masm\"\nnamespace=\"util\"\n",
+            r#"[package]
+name = "util"
+version.workspace = true
+
+[lib]
+path = "mod.masm"
+namespace = "util"
+"#,
         )
         .unwrap();
         fs::write(util_dir.join("mod.masm"), "pub proc helper\n    push.1\nend\n").unwrap();
         fs::write(
             app_dir.join("miden-project.toml"),
-            "[package]\nname=\"app\"\nversion.workspace=true\n[lib]\npath=\"mod.masm\"\nnamespace=\"app\"\n",
+            r#"[package]
+name = "app"
+version.workspace = true
+
+[lib]
+path = "mod.masm"
+namespace = "app"
+"#,
         )
         .unwrap();
         fs::write(app_dir.join("mod.masm"), "pub proc main\n    push.1\nend\n").unwrap();
@@ -3064,22 +3204,44 @@ end
 
         fs::write(
             root.join("miden-project.toml"),
-            "[workspace]\nmembers=[\"util\",\"app\"]\n[workspace.package]\nversion=\"0.1.0\"\\
-             n[workspace.dependencies]\nutil = { path = \"util\" }\n",
+            r#"[workspace]
+members = ["util", "app"]
+
+[workspace.package]
+version = "0.1.0"
+
+[workspace.dependencies]
+util = { path = "util" }
+"#,
         )
         .unwrap();
         fs::write(
             util_dir.join("miden-project.toml"),
-            "[package]\nname=\"util\"\nversion.workspace=true\n[lib]\npath=\"mod.masm\"\\
-             nnamespace=\"util\"\n",
+            r#"[package]
+name = "util"
+version.workspace = true
+
+[lib]
+path = "mod.masm"
+namespace = "util"
+"#,
         )
         .unwrap();
         let util_text = "pub proc helper\n    push.1\nend\n";
         fs::write(util_dir.join("mod.masm"), util_text).unwrap();
         fs::write(
             app_dir.join("miden-project.toml"),
-            "[package]\nname=\"app\"\nversion.workspace=true\n[lib]\npath=\"mod.masm\"\\
-             nnamespace=\"app\"\n[dependencies]\nutil.workspace=true\n",
+            r#"[package]
+name = "app"
+version.workspace = true
+
+[lib]
+path = "mod.masm"
+namespace = "app"
+
+[dependencies]
+util.workspace = true
+"#,
         )
         .unwrap();
         let app_text =
@@ -3122,9 +3284,18 @@ end
 
         write_file(
             &root.join("miden-project.toml"),
-            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[lib]\npath = \
-             \"asm/mod.masm\"\nnamespace = \"pkg::core\"\n\n[[bin]]\nname = \"cli\"\npath = \
-             \"asm/main.masm\"\n",
+            r#"[package]
+name = "app"
+version = "0.1.0"
+
+[lib]
+path = "asm/mod.masm"
+namespace = "pkg::core"
+
+[[bin]]
+name = "cli"
+path = "asm/main.masm"
+"#,
         );
         let lib_text = "use helpers\npub proc root\n    call.helpers::helper\nend\n";
         let helpers_text = "pub proc helper\n    push.1\nend\n";
@@ -3144,11 +3315,9 @@ end
         let entrypoint_hover =
             snapshot.hover_at(&asm_dir.join("main.masm"), Position::new(0, 1)).unwrap();
         match entrypoint_hover.contents {
-            HoverContents::Markup(content) => assert!(
-                content.value.contains("proc ::$exec::$main"),
-                "{}",
-                content.value
-            ),
+            HoverContents::Markup(content) => {
+                assert!(content.value.contains("proc ::$exec::$main"), "{}", content.value)
+            }
             _ => panic!("expected markdown hover"),
         }
 
@@ -3472,6 +3641,199 @@ end
     }
 
     #[test]
+    fn renders_stack_hover_for_primitive_instructions() {
+        let root = temp_dir("stack-hover");
+        fs::write(
+            root.join("miden-project.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[lib]\npath = \
+             \"mod.masm\"\nnamespace = \"app\"\n",
+        )
+        .unwrap();
+        let text = "pub proc main\n    push.1\n    push.2\n    add\nend\n";
+        fs::write(root.join("mod.masm"), text).unwrap();
+
+        let snapshot = ProjectSnapshot::load_for_document(
+            &root.join("mod.masm"),
+            &OverlayMap::default(),
+            &RegistryState::default(),
+            None,
+        )
+        .unwrap();
+
+        let hover = snapshot.hover_at(&root.join("mod.masm"), position_of(text, "add")).unwrap();
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markdown hover");
+        };
+        assert!(content.value.contains("Consumes `2` felts and produces `1` felt"));
+    }
+
+    #[test]
+    fn warns_when_control_flow_branches_are_unbalanced() {
+        let root = temp_dir("stack-branch-warning");
+        fs::write(
+            root.join("miden-project.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[lib]\npath = \
+             \"mod.masm\"\nnamespace = \"app\"\n",
+        )
+        .unwrap();
+        let text = "\
+pub proc main
+    clk
+    if.true
+        push.1
+        push.2
+    else
+        push.1
+    end
+end
+";
+        fs::write(root.join("mod.masm"), text).unwrap();
+
+        let snapshot = ProjectSnapshot::load_for_document(
+            &root.join("mod.masm"),
+            &OverlayMap::default(),
+            &RegistryState::default(),
+            None,
+        )
+        .unwrap();
+
+        let diagnostics = snapshot.semantic_diagnostics(&root.join("mod.masm"));
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains("conditional branches leave different stack states")
+        }));
+    }
+
+    #[test]
+    fn resolves_dynamic_exec_when_source_body_materializes_a_proc_ref() {
+        let root = temp_dir("stack-dynexec-source-summary");
+        fs::write(
+            root.join("miden-project.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[lib]\npath = \
+             \"mod.masm\"\nnamespace = \"app\"\n",
+        )
+        .unwrap();
+        let text = "\
+proc target
+    push.9
+end
+
+proc make_ref
+    procref.target
+end
+
+proc main
+    call.make_ref
+    mem_storew_le.0
+    dropw
+    push.0
+    dynexec
+end
+";
+        fs::write(root.join("mod.masm"), text).unwrap();
+
+        let snapshot = ProjectSnapshot::load_for_document(
+            &root.join("mod.masm"),
+            &OverlayMap::default(),
+            &RegistryState::default(),
+            None,
+        )
+        .unwrap();
+        let hover =
+            snapshot.hover_at(&root.join("mod.masm"), position_of(text, "dynexec")).unwrap();
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markdown hover");
+        };
+        assert!(content.value.contains("resolved `dynexec` via `procref`"));
+    }
+
+    #[test]
+    fn prefers_explicit_signature_over_source_body_for_call_effects() {
+        let root = temp_dir("stack-call-signature-priority");
+        fs::write(
+            root.join("miden-project.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[lib]\npath = \
+             \"mod.masm\"\nnamespace = \"app\"\n",
+        )
+        .unwrap();
+        let text = "\
+proc target
+    push.9
+end
+
+proc make_ref() -> felt
+    procref.target
+end
+
+proc main
+    call.make_ref
+    mem_storew_le.0
+    dropw
+    push.0
+    dynexec
+end
+";
+        fs::write(root.join("mod.masm"), text).unwrap();
+
+        let snapshot = ProjectSnapshot::load_for_document(
+            &root.join("mod.masm"),
+            &OverlayMap::default(),
+            &RegistryState::default(),
+            None,
+        )
+        .unwrap();
+        let hover =
+            snapshot.hover_at(&root.join("mod.masm"), position_of(text, "dynexec")).unwrap();
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markdown hover");
+        };
+        assert!(content.value.contains("dynamic callee could not be traced"));
+        assert!(snapshot.semantic_diagnostics(&root.join("mod.masm")).is_empty());
+    }
+
+    #[test]
+    fn warns_at_call_sites_when_a_callee_body_is_indeterminate() {
+        let root = temp_dir("stack-indeterminate-callee");
+        fs::write(
+            root.join("miden-project.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[lib]\npath = \
+             \"mod.masm\"\nnamespace = \"app\"\n",
+        )
+        .unwrap();
+        let text = "\
+proc branchy
+    clk
+    if.true
+        push.1
+        push.2
+    else
+        push.1
+    end
+end
+
+proc main
+    call.branchy
+end
+";
+        fs::write(root.join("mod.masm"), text).unwrap();
+
+        let snapshot = ProjectSnapshot::load_for_document(
+            &root.join("mod.masm"),
+            &OverlayMap::default(),
+            &RegistryState::default(),
+            None,
+        )
+        .unwrap();
+
+        let diagnostics = snapshot.semantic_diagnostics(&root.join("mod.masm"));
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains("conditional branches leave different stack states")
+        }));
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains("callee stack effects are indeterminate")
+        }));
+    }
+
+    #[test]
     fn emits_code_lenses_for_exports_and_entrypoints() {
         let root = temp_dir("code-lenses");
         let lib_dir = root.join("lib");
@@ -3544,8 +3906,14 @@ end
         let root = temp_dir("rename");
         fs::write(
             root.join("miden-project.toml"),
-            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[lib]\npath = \
-             \"mod.masm\"\nnamespace = \"app\"\n",
+            r#"[package]
+name = "app"
+version = "0.1.0"
+
+[lib]
+path = "mod.masm"
+namespace = "app"
+"#,
         )
         .unwrap();
         let text = "\
@@ -3616,21 +3984,43 @@ end
 
         fs::write(
             root.join("miden-project.toml"),
-            "[workspace]\nmembers=[\"util\",\"app\"]\n[workspace.package]\nversion=\"0.1.0\"\\
-             n[workspace.dependencies]\nutil = { path = \"util\" }\n",
+            r#"[workspace]
+members = ["util", "app"]
+
+[workspace.package]
+version = "0.1.0"
+
+[workspace.dependencies]
+util = { path = "util" }
+"#,
         )
         .unwrap();
         fs::write(
             util_dir.join("miden-project.toml"),
-            "[package]\nname=\"util\"\nversion.workspace=true\n[lib]\npath=\"mod.masm\"\\
-             nnamespace=\"util\"\n",
+            r#"[package]
+name = "util"
+version.workspace = true
+
+[lib]
+path = "mod.masm"
+namespace = "util"
+"#,
         )
         .unwrap();
         fs::write(util_dir.join("mod.masm"), "pub proc helper\n    push.1\nend\n").unwrap();
         fs::write(
             app_dir.join("miden-project.toml"),
-            "[package]\nname=\"app\"\nversion.workspace=true\n[lib]\npath=\"mod.masm\"\\
-             nnamespace=\"app\"\n[dependencies]\nutil.workspace=true\n",
+            r#"[package]
+name = "app"
+version.workspace = true
+
+[lib]
+path = "mod.masm"
+namespace = "app"
+
+[dependencies]
+util.workspace = true
+"#,
         )
         .unwrap();
 

@@ -75,12 +75,21 @@ impl Backend {
             };
 
             let mut diagnostics = document.syntax_diagnostics().to_vec();
-            if include_project
-                && let Ok(path) = uri.to_file_path()
-                && let Some(diagnostic) =
-                    project_diagnostic(&path, &state.registry, state.git_cache_root.as_deref())
-            {
-                diagnostics.push(diagnostic);
+            if let Ok(path) = uri.to_file_path() {
+                let overlays = state.overlays();
+                if let Ok(snapshot) = ProjectSnapshot::load_for_document(
+                    &path,
+                    &overlays,
+                    &state.registry,
+                    state.git_cache_root.as_deref(),
+                ) {
+                    diagnostics.extend(snapshot.semantic_diagnostics(&path));
+                } else if include_project
+                    && let Some(diagnostic) =
+                        project_diagnostic(&path, &state.registry, state.git_cache_root.as_deref())
+                {
+                    diagnostics.push(diagnostic);
+                }
             }
 
             (document.version(), diagnostics)
