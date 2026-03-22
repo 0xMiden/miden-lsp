@@ -11,9 +11,13 @@ Miden LSP assumes that Miden projects are rooted by either a workspace `miden-pr
 Editor integrations are being developed in-tree under `extensions/`.
 
 - `extensions/miden-zed-extension`: Zed extension using `tree-sitter-masm` for editor syntax support and `miden-lsp` for language features
+- `extensions/miden-vscode-extension`: VS Code extension using a lightweight MASM language contribution plus `miden-lsp` for semantic features
 
 To load the Zed extension locally, open Zed's Extensions page, choose `Install Dev Extension` or run the `zed: install dev extension` action, and select `extensions/miden-zed-extension`.
 The extension assumes `miden-lsp` is already available via `PATH`, or configured in Zed with `lsp.binary.path` for `miden-lsp`.
+
+To work on the VS Code extension locally, run `npm install` and `npm run compile` in `extensions/miden-vscode-extension`, then open that folder in VS Code and launch an Extension Development Host.
+The extension assumes `miden-lsp` is already available via `PATH`, or configured with `miden-lsp.binary.path`.
 
 ## Roadmap
 

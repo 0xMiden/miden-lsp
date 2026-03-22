@@ -1,0 +1,5 @@
+{
+  "repository": "https://github.com/0xmiden/tree-sitter-masm",
+  "commit": "3dfc7c1f687a0a287afe3b1c01ff7be6f0a42241",
+  "note": "The VS Code extension uses a lightweight TextMate grammar plus semantic tokens from miden-lsp in v1. This lock records the tree-sitter-masm lineage the fallback editor behavior was aligned against."
+}
