@@ -1,6 +1,0 @@
-.gitignore
-.vscode/**
-.vscode-test/**
-node_modules/**/.bin/**
-src/**
-tsconfig.json
