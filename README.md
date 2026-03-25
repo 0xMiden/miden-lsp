@@ -92,18 +92,12 @@ The server currently supports the following initialization options:
 
 Editor integrations are being developed as well:
 
-- `extensions/miden-zed-extension`: Zed extension using `tree-sitter-masm` for
+- [`zed-extension`](https://github.com/0xMiden/zed-extension): Zed extension using `tree-sitter-masm` for
   editor syntax support and `miden-lsp` for semantic features
-- [`miden-vscode-extension`](https://github.com/0xMiden/miden-vscode-extension): VS Code extension using a lightweight
+- [`vscode-extension`](https://github.com/0xMiden/vscode-extension): VS Code extension using a lightweight
   MASM language contribution plus `miden-lsp` for semantic features
 
-To load the Zed extension locally, open Zed's Extensions page, choose
-`Install Dev Extension` or run the `zed: install dev extension` action, and
-select `extensions/miden-zed-extension`. The extension assumes `miden-lsp` is
-available via `PATH`, or configured in Zed with `lsp.binary.path` for
-`miden-lsp`.
-
-To work on the VS Code extension locally, see the instructions at the link above.
+See the installation and usage instructions in their respective repos.
 
 ## Future Roadmap
 
