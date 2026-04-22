@@ -1595,7 +1595,7 @@ fn analyze_source_module(
     for child in parsed.tree.root_node().named_children(&mut cursor) {
         match child.kind() {
             "doc_comment" => {
-                pending_docs.push(normalize_doc_comment(&node_text(child, &parsed.text)?))
+                pending_docs.push(normalize_doc_comment(node_text(child, &parsed.text)?))
             }
             "import" => {
                 parse_import(&mut module, child, parsed)?;
@@ -3116,7 +3116,7 @@ mod tests {
         .unwrap();
         let text = "\
 #! Summary
-#! 
+#!
 #! Details:
 #!   - preserved indentation
 pub proc foo(a: u32) -> u32
@@ -3149,7 +3149,7 @@ end
 
     #[test]
     fn normalizes_doc_comment_lines_without_trimming_body_formatting() {
-        let docs = vec![
+        let docs = [
             normalize_doc_comment("#! top line"),
             normalize_doc_comment("#!"),
             normalize_doc_comment("#!   indented"),
