@@ -43,7 +43,7 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   upload-artifacts:
-    name: upload pre-built miden-debug executable artifacts
+    name: upload pre-built miden-lsp executable artifacts
     needs: publish
     if: ${{ github.repository_owner == '0xMiden' && needs.publish.outputs.releases_created == 'true' }}
     permissions:
@@ -74,12 +74,12 @@ jobs:
       - name: build
         run: |
           set -e
-          cargo make -p production miden-debug --release --target ${{ matrix.target }}
-          mv target/${{ matrix.target }}/release/miden-debug miden-debug-${{ matrix.target }}
+          cargo make -p production miden-lsp --release --target ${{ matrix.target }}
+          mv target/${{ matrix.target }}/release/miden-lsp miden-lsp-${{ matrix.target }}
       - name: attest
         uses: actions/attest-build-provenance@v3
         with:
-          subject-path: "miden-debug-${{ matrix.target }}"
+          subject-path: "miden-lsp-${{ matrix.target }}"
       - name: upload
         env:
           RELEASES: ${{ needs.publish.outputs.releases }}
@@ -92,7 +92,7 @@ jobs:
           echo "=================="
           release_version=$(echo "${RELEASES}" | jq -r '.[0].version')
           release_tag=$(echo "${RELEASES}" | jq -r '.[0].tag')
-          gh release upload ${release_tag} miden-debug-${{ matrix.target }}
+          gh release upload ${release_tag} miden-lsp-${{ matrix.target }}
 
   release:
     name: prepare the next release
