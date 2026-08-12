@@ -1518,6 +1518,10 @@ fn collect_masm_files(dir: &FsPath, files: &mut Vec<PathBuf>) -> Result<(), Stri
         let entry = entry.map_err(|error| error.to_string())?;
         let path = entry.path();
         if path.is_dir() {
+            if path.file_name().is_some_and(|name| name == "target") {
+                continue;
+            }
+
             collect_masm_files(&path, files)?;
         } else if path.extension().is_some_and(|ext| ext == "masm") {
             files.push(normalize_path(&path));
@@ -3275,6 +3279,37 @@ namespace = "app"
             "helper",
         );
         assert!(symbols.iter().any(|symbol| symbol.name == "helper"));
+    }
+
+    #[test]
+    fn skips_target_directory_when_indexing_workspace_symbols() {
+        let root = temp_dir("workspace-symbols-target");
+        write_file(
+            &root.join("miden-project.toml"),
+            r#"[package]
+name = "app"
+version = "0.1.0"
+
+[lib]
+path = "mod.masm"
+namespace = "app"
+"#,
+        );
+        write_file(&root.join("mod.masm"), "pub proc main\n    push.1\nend\n");
+        write_file(
+            &root.join("target").join("generated.masm"),
+            "pub proc generated\n    push.1\nend\n",
+        );
+
+        let symbols = ProjectSnapshot::workspace_symbols(
+            std::slice::from_ref(&root),
+            &OverlayMap::default(),
+            &RegistryState::default(),
+            None,
+            "generated",
+        );
+
+        assert!(symbols.is_empty());
     }
 
     #[test]
