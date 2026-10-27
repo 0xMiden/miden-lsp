@@ -4,10 +4,10 @@
 (MASM), with project-aware analysis for Miden workspaces rooted by
 `miden-project.toml`.
 
-The server uses `tree-sitter-masm` for live document parsing and
-`miden-project` for manifest, target, namespace, and dependency resolution. When
-dependency source is unavailable, it can fall back to `.masp` package metadata
-via `miden-mast-package`.
+The server uses the assembler's lossless CST for live parsing and its project
+assembler for semantic diagnostics, including unsaved document overlays.
+`miden-project` provides manifest and dependency resolution; compiled dependencies
+are indexed through the package manifest and unified package debug information.
 
 ## Implemented Features
 
@@ -17,7 +17,8 @@ Current server functionality includes:
 - Target-aware source-to-namespace mapping for `[lib]` and `[[bin]]` targets
 - Dependency resolution across workspace, path, git, and registry dependencies
 - In-memory registry support seeded from preassembled `.masp` artifacts
-- Syntax diagnostics from `tree-sitter-masm`
+- Syntax diagnostics from the assembler's lossless CST parser
+- Project-assembler diagnostics for unresolved symbols and invalid modules
 - Project diagnostics for manifest loading and validation failures
 - Stack-effect diagnostics for unbalanced control flow and indeterminate callees
 - Document symbols and workspace symbols
@@ -41,9 +42,7 @@ integrated with Rust editor tooling.
 
 ### Prerequisites
 
-- A Rust toolchain recent enough to build this crate
-- A checkout of `miden-lsp` alongside the sibling `miden-vm` repository, since
-  this crate currently depends on local `../miden-vm` paths
+- The pinned Rust toolchain (installed automatically by rustup)
 - A Miden project or workspace rooted by `miden-project.toml`
 
 ### Build
@@ -80,13 +79,23 @@ The server currently supports the following initialization options:
 ```json
 {
   "registryArtifacts": ["/abs/path/to/package-a.masp", "/abs/path/to/package-b.masp"],
-  "gitCacheRoot": "/abs/path/to/git-cache"
+  "gitCacheRoot": "/abs/path/to/git-cache",
+  "sysroot": "/abs/path/to/miden-toolchain"
 }
 ```
 
 - `registryArtifacts`: preassembled `.masp` artifacts to load into the in-memory
   registry used for registry-backed dependency resolution
 - `gitCacheRoot`: optional directory for cached git dependencies
+- `sysroot`: optional toolchain directory; packages in its `lib/` directory are
+  available to dependency resolution. Defaults to `MIDEN_SYSROOT` when launched
+  through midenup. No toolchains are downloaded or switched by the server.
+
+This server uses VM 0.36.2 APIs. Run the server and use packages from a compatible
+toolchain; selecting a sysroot does not make incompatible package formats readable.
+Compiler-HIR/disassembler analysis and success-with-warning reporting from the
+upstream diagnostics rewrite remain follow-up work. The existing conservative
+AST stack analysis is retained; unsupported effects are not assumed to be balanced.
 
 ### Editor Integrations
 

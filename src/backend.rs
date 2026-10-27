@@ -35,7 +35,7 @@ use crate::{
 struct ServerState {
     documents: BTreeMap<Url, TextDocument>,
     git_cache_root: Option<PathBuf>,
-    registry: RegistryState,
+    registry: Arc<RegistryState>,
     workspace_folders: Vec<PathBuf>,
 }
 
@@ -68,56 +68,102 @@ impl Backend {
     }
 
     async fn publish_diagnostics(&self, uri: Url, include_project: bool) {
-        let diagnostics = {
+        let (version, mut diagnostics, overlays, registry, git_cache_root) = {
             let state = self.state.read().await;
             let Some(document) = state.documents.get(&uri) else {
                 return;
             };
-
-            let mut diagnostics = document.syntax_diagnostics().to_vec();
-            if let Ok(path) = uri.to_file_path() {
-                let overlays = state.overlays();
-                if let Ok(snapshot) = ProjectSnapshot::load_for_document(
+            (
+                document.version(),
+                document.syntax_diagnostics().to_vec(),
+                state.overlays(),
+                state.registry.clone(),
+                state.git_cache_root.clone(),
+            )
+        };
+        let syntax_valid = diagnostics.is_empty();
+        if let Ok(path) = uri.to_file_path() {
+            let analysis = tokio::task::spawn_blocking(move || {
+                let mut diagnostics = Vec::new();
+                match ProjectSnapshot::load_for_document(
                     &path,
                     &overlays,
-                    &state.registry,
-                    state.git_cache_root.as_deref(),
+                    &registry,
+                    git_cache_root.as_deref(),
                 ) {
-                    diagnostics.extend(snapshot.semantic_diagnostics(&path));
-                } else if include_project
-                    && let Some(diagnostic) =
-                        project_diagnostic(&path, &state.registry, state.git_cache_root.as_deref())
-                {
-                    diagnostics.push(diagnostic);
+                    Ok(snapshot) => {
+                        diagnostics.extend(snapshot.semantic_diagnostics(&path));
+                        if syntax_valid {
+                            match registry.assembly_cache() {
+                                Ok(cache) => diagnostics
+                                    .extend(crate::project::diagnostics(&path, &overlays, cache)),
+                                Err(error) => {
+                                    tracing::warn!(%error, "unable to prepare assembler cache")
+                                }
+                            }
+                        }
+                    }
+                    Err(_) if include_project => {
+                        if let Some(diagnostic) =
+                            project_diagnostic(&path, &registry, git_cache_root.as_deref())
+                        {
+                            diagnostics.push(diagnostic);
+                        }
+                    }
+                    Err(_) => (),
                 }
+                diagnostics
+            })
+            .await;
+            match analysis {
+                Ok(analysis) => diagnostics.extend(analysis),
+                Err(error) => tracing::error!(%error, "project analysis failed"),
             }
-
-            (document.version(), diagnostics)
-        };
-
-        self.client.publish_diagnostics(uri, diagnostics.1, Some(diagnostics.0)).await;
+        }
+        if self
+            .state
+            .read()
+            .await
+            .documents
+            .get(&uri)
+            .is_some_and(|document| document.version() == version)
+        {
+            self.client.publish_diagnostics(uri, diagnostics, Some(version)).await;
+        }
     }
 
     async fn snapshot_for_path(&self, path: &Path) -> Option<ProjectSnapshot> {
         let path = normalize_path(path);
-        let state = self.state.read().await;
-        ProjectSnapshot::load_for_document(
-            &path,
-            &state.overlays(),
-            &state.registry,
-            state.git_cache_root.as_deref(),
-        )
+        let (overlays, registry, git_cache_root) = {
+            let state = self.state.read().await;
+            (state.overlays(), state.registry.clone(), state.git_cache_root.clone())
+        };
+        tokio::task::spawn_blocking(move || {
+            ProjectSnapshot::load_for_document(
+                &path,
+                &overlays,
+                &registry,
+                git_cache_root.as_deref(),
+            )
+            .ok()
+        })
+        .await
         .ok()
+        .flatten()
     }
 }
 
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
-        let options = params
+        let mut options = params
             .initialization_options
             .and_then(|value| serde_json::from_value::<InitializationOptions>(value).ok())
             .unwrap_or_default();
+
+        if options.sysroot.is_none() {
+            options.sysroot = std::env::var_os("MIDEN_SYSROOT").map(PathBuf::from);
+        }
 
         let workspace_folders = params
             .workspace_folders
@@ -132,7 +178,7 @@ impl LanguageServer for Backend {
 
         let mut state = self.state.write().await;
         state.git_cache_root = options.git_cache_root;
-        state.registry = registry;
+        state.registry = Arc::new(registry);
         state.workspace_folders = workspace_folders;
 
         Ok(InitializeResult {
@@ -506,6 +552,61 @@ mod tests {
                 return request.params().cloned().unwrap_or(Value::Null);
             }
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn publishes_assembler_errors_for_unsaved_buffers_and_clears_them_after_edits() {
+        let root = temp_dir("assembler-overlays");
+        write_file(
+            &root.join("miden-project.toml"),
+            "[package]\nname = \"app\"\nversion = \"1.0.0\"\n[lib]\npath = \"mod.masm\"\nnamespace = \"app\"\n",
+        );
+        let source = root.join("mod.masm");
+        let valid = "pub proc main\npush.1 drop\nend\n";
+        write_file(&source, valid);
+        let uri = Url::from_file_path(&source).unwrap();
+        let (mut service, mut socket) = LspService::new(Backend::new);
+        let (tx, mut rx) = mpsc::unbounded_channel::<Request>();
+        tokio::spawn(async move {
+            while let Some(request) = socket.next().await {
+                let _ = tx.send(request);
+            }
+        });
+        call(&mut service, "initialize", json!({"capabilities": {}}), 1).await;
+        notify(&mut service, "initialized", json!({})).await;
+        notify(
+            &mut service,
+            "textDocument/didOpen",
+            json!({
+                "textDocument": { "uri": uri, "languageId": "masm", "version": 1,
+                    "text": "pub proc main\nexec.missing\nend\n" }
+            }),
+        )
+        .await;
+        let errors = next_notification(&mut rx, "textDocument/publishDiagnostics").await;
+        assert_eq!(errors["version"], 1);
+        assert!(
+            errors["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|error| error["source"] == "miden-assembler"
+                    && error["message"].as_str().unwrap().contains("undefined symbol")),
+            "{errors}"
+        );
+        notify(
+            &mut service,
+            "textDocument/didChange",
+            json!({
+                "textDocument": { "uri": uri, "version": 2 },
+                "contentChanges": [{"text": valid}]
+            }),
+        )
+        .await;
+        let errors = next_notification(&mut rx, "textDocument/publishDiagnostics").await;
+        assert_eq!(errors["version"], 2);
+        assert!(errors["diagnostics"].as_array().unwrap().is_empty(), "{errors}");
+        assert_eq!(std::fs::read_to_string(source).unwrap(), valid);
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -1,9 +1,12 @@
 use std::ops::Range as StdRange;
 
+use std::sync::Arc;
 use tower_lsp::lsp_types::{
     Diagnostic, DiagnosticSeverity, Position, Range, TextDocumentContentChangeEvent, Url,
 };
-use tree_sitter::{Parser, Point, Tree};
+
+use miden_assembly_syntax::debuginfo::{DefaultSourceManager, SourceLanguage, SourceManager, Uri};
+use miden_assembly_syntax_cst::{Parse, parse_source_file};
 
 #[derive(Debug)]
 pub struct TextDocument {
@@ -11,13 +14,13 @@ pub struct TextDocument {
     version: i32,
     text: String,
     line_offsets: Vec<usize>,
-    tree: Tree,
+    tree: Parse,
     syntax_diagnostics: Vec<Diagnostic>,
 }
 
 impl TextDocument {
     pub fn new(uri: Url, version: i32, text: String) -> Result<Self, String> {
-        let (tree, syntax_diagnostics) = parse_text(&text)?;
+        let (tree, syntax_diagnostics) = parse_document(&uri, &text)?;
         let line_offsets = compute_line_offsets(&text);
         Ok(Self {
             uri,
@@ -50,17 +53,25 @@ impl TextDocument {
         version: i32,
         changes: Vec<TextDocumentContentChangeEvent>,
     ) -> Result<(), String> {
+        let mut text = self.text.clone();
+        let mut line_offsets = self.line_offsets.clone();
         for change in changes {
             if let Some(range) = change.range {
-                let offsets = self.range_to_offsets(range)?;
-                self.text.replace_range(offsets, &change.text);
+                let start = position_to_offset(&text, &line_offsets, range.start)?;
+                let end = position_to_offset(&text, &line_offsets, range.end)?;
+                if start > end {
+                    return Err("range end precedes its start".into());
+                }
+                text.replace_range(start..end, &change.text);
             } else {
-                self.text = change.text;
+                text = change.text;
             }
-            self.line_offsets = compute_line_offsets(&self.text);
+            line_offsets = compute_line_offsets(&text);
         }
 
-        let (tree, diagnostics) = parse_text(&self.text)?;
+        let (tree, diagnostics) = parse_document(&self.uri, &text)?;
+        self.text = text;
+        self.line_offsets = line_offsets;
         self.tree = tree;
         self.syntax_diagnostics = diagnostics;
         self.version = version;
@@ -78,20 +89,47 @@ impl TextDocument {
     pub fn range_to_offsets(&self, range: Range) -> Result<StdRange<usize>, String> {
         let start = self.position_to_offset(range.start)?;
         let end = self.position_to_offset(range.end)?;
+        if start > end {
+            return Err("range end precedes its start".into());
+        }
         Ok(start..end)
     }
 }
 
-pub fn parse_text(text: &str) -> Result<(Tree, Vec<Diagnostic>), String> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_masm::LANGUAGE.into())
-        .map_err(|error| format!("failed to load tree-sitter-masm language: {error}"))?;
+pub fn parse_text(text: &str) -> Result<(Parse, Vec<Diagnostic>), String> {
+    parse_document(&Url::parse("untitled:miden.masm").unwrap(), text)
+}
 
-    let tree = parser
-        .parse(text, None)
-        .ok_or_else(|| "tree-sitter failed to parse document".to_string())?;
-    let diagnostics = collect_syntax_diagnostics(text, &tree);
+pub fn parse_document(uri: &Url, text: &str) -> Result<(Parse, Vec<Diagnostic>), String> {
+    let manager = Arc::new(DefaultSourceManager::default());
+    let source = manager.load(SourceLanguage::Masm, Uri::new(uri.as_str()), text.to_owned());
+    let tree = parse_source_file(source);
+    let line_offsets = compute_line_offsets(text);
+    let diagnostics = tree
+        .diagnostics()
+        .iter()
+        .map(|error| {
+            let bounds = error
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.first())
+                .map(|label| label.offset()..label.offset() + label.len())
+                .unwrap_or(0..0);
+            Diagnostic {
+                range: byte_range_to_lsp_range(text, &line_offsets, bounds),
+                severity: Some(DiagnosticSeverity::ERROR),
+                source: Some("miden-assembler".into()),
+                message: error
+                    .labels
+                    .as_ref()
+                    .and_then(|labels| labels.first())
+                    .and_then(|label| label.label())
+                    .map(|label| format!("{}: {label}", error.message))
+                    .unwrap_or_else(|| error.message.clone()),
+                ..Diagnostic::default()
+            }
+        })
+        .collect();
     Ok((tree, diagnostics))
 }
 
@@ -125,6 +163,9 @@ pub fn position_to_offset(
         if utf16_units >= target_units {
             return Ok(line_start + offset);
         }
+        if utf16_units + ch.len_utf16() > target_units {
+            return Err("position splits a UTF-16 surrogate pair".into());
+        }
         utf16_units += ch.len_utf16();
     }
 
@@ -139,7 +180,10 @@ pub fn position_to_offset(
 }
 
 pub fn offset_to_position(text: &str, line_offsets: &[usize], offset: usize) -> Position {
-    let bounded = offset.min(text.len());
+    let mut bounded = offset.min(text.len());
+    while !text.is_char_boundary(bounded) {
+        bounded -= 1;
+    }
     let line = match line_offsets.binary_search(&bounded) {
         Ok(index) => index,
         Err(index) => index.saturating_sub(1),
@@ -148,10 +192,6 @@ pub fn offset_to_position(text: &str, line_offsets: &[usize], offset: usize) -> 
     let line_slice = &text[line_start..bounded];
     let character = line_slice.encode_utf16().count();
     Position::new(line as u32, character as u32)
-}
-
-pub fn point_to_position(point: Point) -> Position {
-    Position::new(point.row as u32, point.column as u32)
 }
 
 pub fn byte_range_to_lsp_range(
@@ -165,45 +205,83 @@ pub fn byte_range_to_lsp_range(
     )
 }
 
-fn collect_syntax_diagnostics(text: &str, tree: &Tree) -> Vec<Diagnostic> {
-    let line_offsets = compute_line_offsets(text);
-    let mut diagnostics = Vec::new();
-    let mut cursor = tree.walk();
-    let mut pending = vec![tree.root_node()];
-
-    while let Some(node) = pending.pop() {
-        if node.is_error() || node.is_missing() {
-            let start = node.start_byte();
-            let mut end = node.end_byte();
-            if end <= start {
-                end = start.saturating_add(1).min(text.len());
-            }
-            diagnostics.push(Diagnostic {
-                range: byte_range_to_lsp_range(text, &line_offsets, start..end),
-                severity: Some(DiagnosticSeverity::ERROR),
-                message: if node.is_missing() {
-                    format!("missing {}", node.kind())
-                } else {
-                    "syntax error".to_string()
-                },
-                ..Diagnostic::default()
-            });
-        }
-
-        for child in node.named_children(&mut cursor) {
-            pending.push(child);
-        }
-    }
-
-    diagnostics
-        .sort_by_key(|diagnostic| (diagnostic.range.start.line, diagnostic.range.start.character));
-    diagnostics.dedup_by(|left, right| left.range == right.range && left.message == right.message);
-    diagnostics
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn assembler_cst_preserves_trivia_and_the_source_uri() {
+        let uri = Url::parse("file:///tmp/lossless.masm").unwrap();
+        let text = "#! docs\npub proc helper # comment\n    push.1 drop\nend\n";
+        let document = TextDocument::new(uri.clone(), 1, text.to_string()).unwrap();
+        assert!(document.syntax_diagnostics().is_empty());
+        assert_eq!(document.tree.syntax().text().to_string(), text);
+        assert_eq!(document.tree.source().uri().as_str(), uri.as_str());
+    }
+
+    #[test]
+    fn assembler_cst_reports_incomplete_blocks_without_discarding_the_tree() {
+        let text = "pub proc helper\n    push.1\n";
+        let (tree, diagnostics) = parse_text(text).unwrap();
+        assert_eq!(tree.syntax().text().to_string(), text);
+        assert!(!diagnostics.is_empty());
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic.message.contains("end")));
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.source.as_deref() == Some("miden-assembler"))
+        );
+    }
+
+    #[test]
+    fn changes_use_utf16_offsets_and_reject_split_surrogates() {
+        let uri = Url::parse("file:///tmp/unicode.masm").unwrap();
+        let mut document =
+            TextDocument::new(uri, 1, "# 😀 comment\npub proc foo\nnop\nend\n".to_string())
+                .unwrap();
+        assert!(document.position_to_offset(Position::new(0, 3)).is_err());
+        assert_eq!(document.position_to_offset(Position::new(0, 4)).unwrap(), "# 😀".len());
+        document
+            .apply_changes(
+                2,
+                vec![TextDocumentContentChangeEvent {
+                    range: Some(Range::new(Position::new(0, 2), Position::new(0, 4))),
+                    range_length: None,
+                    text: "ok".into(),
+                }],
+            )
+            .unwrap();
+        assert!(document.text().starts_with("# ok comment"));
+        assert_eq!(document.tree.syntax().text().to_string(), document.text());
+    }
+
+    #[test]
+    fn invalid_change_batches_do_not_leave_text_and_cst_out_of_sync() {
+        let uri = Url::parse("file:///tmp/changes.masm").unwrap();
+        let original = "pub proc foo\nnop\nend\n";
+        let mut document = TextDocument::new(uri, 1, original.into()).unwrap();
+        let changes = vec![
+            TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: "begin end".into(),
+            },
+            TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(99, 0), Position::new(99, 1))),
+                range_length: None,
+                text: "bad".into(),
+            },
+        ];
+        assert!(document.apply_changes(2, changes).is_err());
+        assert_eq!(document.text(), original);
+        assert_eq!(document.tree.syntax().text().to_string(), original);
+        assert_eq!(document.version(), 1);
+        assert!(
+            document
+                .range_to_offsets(Range::new(Position::new(0, 5), Position::new(0, 1)))
+                .is_err()
+        );
+    }
 
     #[test]
     fn applies_incremental_changes_against_utf16_positions() {

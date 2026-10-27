@@ -6,19 +6,19 @@ version = "0.1.2"
 edition = "2024"
 
 [dependencies]
-miden-assembly-syntax = "0.22.1"
-miden-core = "0.22.1"
-miden-mast-package = "0.22.1"
-miden-package-registry = { version = "0.22.1", features = ["resolver"] }
-miden-project = "0.22.1"
+miden-assembly = "0.36.2"
+miden-assembly-syntax = "0.36.2"
+miden-assembly-syntax-cst = "0.36.2"
+miden-core = "0.36.2"
+miden-mast-package = "0.36.2"
+miden-package-registry = { version = "0.36.2", features = ["resolver"] }
+miden-project = "0.36.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.50", features = ["io-std", "macros", "rt-multi-thread", "sync"] }
 tower-lsp = "0.20.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-tree-sitter = "0.26"
-tree-sitter-masm = "0.1"
 
 [dev-dependencies]
 futures = "0.3"

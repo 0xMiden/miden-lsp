@@ -5,18 +5,22 @@ use std::{
 };
 
 use miden_assembly_syntax::{
-    Felt, Parse, ParseOptions,
+    Felt, Path as MasmPath,
     ast::{
         Block, FunctionType as AstFunctionType, Instruction, InvocationTarget, ModuleKind, Op,
         TypeExpr, types,
     },
     debuginfo::{DefaultSourceManager, SourceSpan, Spanned},
+    parser::ModuleParser,
+};
+use miden_assembly_syntax_cst::{
+    SyntaxKind, SyntaxToken,
+    ast::{AstNode, Item},
 };
 use tower_lsp::lsp_types::{
     Diagnostic, DiagnosticSeverity, InlayHint, InlayHintKind, InlayHintLabel, MarkupContent,
     MarkupKind, Position, Range,
 };
-use tree_sitter::Node;
 
 use crate::{
     analysis::{ItemKind, ReferenceKind},
@@ -104,7 +108,7 @@ pub(crate) struct StackModuleInput {
     pub module_path: String,
     pub text: String,
     pub line_offsets: Vec<usize>,
-    pub executable_root: bool,
+    pub kind: ModuleKind,
     pub resolved_references: Vec<StackResolvedReference>,
 }
 
@@ -391,15 +395,9 @@ pub(crate) fn signature_from_function_type(
 
 fn parse_module_input(input: &StackModuleInput) -> Option<Vec<SourceProcedure>> {
     let source_manager = Arc::new(DefaultSourceManager::default());
-    let kind = if input.executable_root {
-        ModuleKind::Executable
-    } else {
-        ModuleKind::Library
-    };
-    let module = input
-        .text
-        .clone()
-        .parse_with_options(source_manager, ParseOptions::new(kind, input.module_path.as_str()))
+    let path = MasmPath::new(&input.module_path);
+    let module = ModuleParser::new(Some(input.kind))
+        .parse_str(Some(path), &input.text, source_manager)
         .ok()?;
 
     let document = Arc::new(DocumentContext {
@@ -419,7 +417,7 @@ fn parse_module_input(input: &StackModuleInput) -> Option<Vec<SourceProcedure>> 
         .types()
         .map(|decl| (decl.name().as_str().to_string(), decl.ty()))
         .collect::<BTreeMap<_, _>>();
-    let source_signatures = parse_tree_sitter_signatures(&input.text, &input.module_path);
+    let source_signatures = parse_cst_signatures(&input.text, &input.module_path);
 
     Some(
         module
@@ -438,124 +436,100 @@ fn parse_module_input(input: &StackModuleInput) -> Option<Vec<SourceProcedure>> 
 }
 
 #[derive(Clone, Debug)]
-struct TreeSitterSignature {
-    params: Vec<TreeSitterSignaturePart>,
-    results: Vec<TreeSitterSignaturePart>,
+struct SourceSignature {
+    params: Vec<SourceSignaturePart>,
+    results: Vec<SourceSignaturePart>,
 }
 
 #[derive(Clone, Debug)]
-struct TreeSitterSignaturePart {
+struct SourceSignaturePart {
     name: Option<String>,
     type_label: String,
 }
 
-fn parse_tree_sitter_signatures(
-    text: &str,
-    module_path: &str,
-) -> BTreeMap<String, TreeSitterSignature> {
+fn parse_cst_signatures(text: &str, module_path: &str) -> BTreeMap<String, SourceSignature> {
     let Ok((tree, _)) = parse_text(text) else {
         return BTreeMap::new();
     };
-
     let mut signatures = BTreeMap::new();
-    let mut pending = vec![tree.root_node()];
-
-    while let Some(node) = pending.pop() {
-        if node.kind() == "procedure" {
-            let Some(name_node) = node.child_by_field_name("name") else {
-                continue;
-            };
-            let Some(name) = tree_sitter_node_text(name_node, text) else {
-                continue;
-            };
-            let path = format!("{module_path}::{name}");
-            if let Some(signature_node) = node.child_by_field_name("signature")
-                && let Some(signature) = parse_tree_sitter_signature(signature_node, text)
-            {
-                signatures.insert(path, signature);
-            }
+    for item in tree.root().items() {
+        let Item::Procedure(procedure) = item else {
             continue;
+        };
+        let (Some(name), Some(signature)) = (procedure.name_token(), procedure.signature()) else {
+            continue;
+        };
+        let tokens = signature
+            .syntax()
+            .descendants_with_tokens()
+            .filter_map(|element| element.into_token())
+            .filter(|token| !token.kind().is_trivia())
+            .collect::<Vec<_>>();
+        let mut index = 0;
+        let params = signature_parts(&tokens, &mut index);
+        if tokens.get(index).is_some_and(|token| token.kind() == SyntaxKind::RArrow) {
+            index += 1;
         }
-
-        for index in (0..node.named_child_count()).rev() {
-            if let Some(child) = node.named_child(index as u32) {
-                pending.push(child);
-            }
-        }
+        let results = signature_parts(&tokens, &mut index);
+        signatures
+            .insert(format!("{module_path}::{}", name.text()), SourceSignature { params, results });
     }
-
     signatures
 }
 
-fn parse_tree_sitter_signature(node: Node<'_>, text: &str) -> Option<TreeSitterSignature> {
-    let mut params = Vec::new();
-    let mut results = Vec::new();
-
-    for index in 0..node.named_child_count() {
-        let child = node.named_child(index as u32)?;
-        match child.kind() {
-            "function_param" => params.push(parse_tree_sitter_signature_part(child, text)?),
-            "function_results" => {
-                results = parse_tree_sitter_results(child, text).unwrap_or_default()
-            }
-            _ => {}
-        }
+fn signature_parts(tokens: &[SyntaxToken], index: &mut usize) -> Vec<SourceSignaturePart> {
+    let parenthesized = tokens.get(*index).is_some_and(|token| token.kind() == SyntaxKind::LParen);
+    if parenthesized {
+        *index += 1;
     }
-
-    Some(TreeSitterSignature { params, results })
-}
-
-fn parse_tree_sitter_results(node: Node<'_>, text: &str) -> Option<Vec<TreeSitterSignaturePart>> {
-    let Some(result) = node.named_child(0) else {
-        let raw = tree_sitter_node_text(node, text)?.trim();
-        let type_label = raw.strip_prefix("->")?.trim();
-        return Some(if type_label.is_empty() {
-            Vec::new()
-        } else {
-            vec![TreeSitterSignaturePart {
-                name: None,
-                type_label: type_label.to_string(),
-            }]
-        });
-    };
-
-    match result.kind() {
-        "type_expr" => Some(vec![TreeSitterSignaturePart {
-            name: None,
-            type_label: tree_sitter_node_text(result, text)?.trim().to_string(),
-        }]),
-        "function_result_list" => {
-            let mut results = Vec::new();
-            for index in 0..result.named_child_count() {
-                let child = result.named_child(index as u32)?;
-                if child.kind() == "function_result" {
-                    results.push(parse_tree_sitter_signature_part(child, text)?);
+    let mut groups = Vec::new();
+    let mut start = *index;
+    let mut depth = 0usize;
+    while let Some(token) = tokens.get(*index) {
+        match token.kind() {
+            SyntaxKind::RParen if depth == 0 && parenthesized => {
+                if start != *index {
+                    groups.push(&tokens[start..*index]);
                 }
+                *index += 1;
+                break;
             }
-            Some(results)
+            SyntaxKind::Comma if depth == 0 => {
+                groups.push(&tokens[start..*index]);
+                *index += 1;
+                start = *index;
+                continue;
+            }
+            SyntaxKind::LParen | SyntaxKind::LBracket | SyntaxKind::LBrace | SyntaxKind::LAngle => {
+                depth += 1
+            }
+            SyntaxKind::RParen | SyntaxKind::RBracket | SyntaxKind::RBrace | SyntaxKind::RAngle => {
+                depth = depth.saturating_sub(1)
+            }
+            _ => (),
         }
-        _ => None,
+        *index += 1;
     }
-}
-
-fn parse_tree_sitter_signature_part(node: Node<'_>, text: &str) -> Option<TreeSitterSignaturePart> {
-    let type_node = node.child_by_field_name("type")?;
-    Some(TreeSitterSignaturePart {
-        name: node
-            .child_by_field_name("name")
-            .and_then(|name| tree_sitter_node_text(name, text))
-            .map(str::to_string),
-        type_label: tree_sitter_node_text(type_node, text)?.trim().to_string(),
-    })
-}
-
-fn tree_sitter_node_text<'a>(node: Node<'_>, text: &'a str) -> Option<&'a str> {
-    text.get(node.byte_range())
+    if !parenthesized && start != *index {
+        groups.push(&tokens[start..*index]);
+    }
+    groups
+        .into_iter()
+        .filter(|group| !group.is_empty())
+        .map(|group| {
+            let named = group.get(1).is_some_and(|token| token.kind() == SyntaxKind::Colon);
+            let type_tokens = if named { &group[2..] } else { group };
+            SourceSignaturePart {
+                name: named.then(|| group[0].text().to_string()),
+                type_label: type_tokens.iter().map(|token| token.text()).collect(),
+            }
+        })
+        .collect()
 }
 
 fn source_signature(
     signature: &AstFunctionType,
-    source_signature: Option<&TreeSitterSignature>,
+    source_signature: Option<&SourceSignature>,
     local_types: &BTreeMap<String, TypeExpr>,
 ) -> Option<StackSignature> {
     let input_slots =
@@ -568,7 +542,7 @@ fn source_signature(
 
 fn signature_slots(
     types: &[TypeExpr],
-    source_parts: Option<&Vec<TreeSitterSignaturePart>>,
+    source_parts: Option<&Vec<SourceSignaturePart>>,
     local_types: &BTreeMap<String, TypeExpr>,
 ) -> Option<Vec<DisplaySlot>> {
     let mut slots = Vec::new();
@@ -639,10 +613,12 @@ fn type_expr_to_concrete_type(
                 .iter()
                 .map(|field| type_expr_to_concrete_type(&field.ty, local_types, depth + 1))
                 .collect::<Option<Vec<_>>>()?;
-            Some(types::Type::Struct(Arc::new(types::StructType::from_parts(
-                struct_ty.name.clone().map(|name| name.into_inner()),
-                struct_ty.repr.into_inner(),
-                fields,
+            Some(types::Type::Struct(types::StructRef::Plain(Arc::new(
+                types::StructType::from_parts(
+                    struct_ty.name.clone().map(|name| name.into_inner()),
+                    struct_ty.repr.into_inner(),
+                    fields,
+                ),
             ))))
         }
         TypeExpr::Ref(path) => {
@@ -743,6 +719,9 @@ impl Analyzer {
                     then_blk, else_blk, ..
                 } => self.analyze_if(procedure, range, then_blk, else_blk, state),
                 Op::While { body, .. } => self.analyze_while(procedure, range, body, state),
+                Op::DoWhile { .. } => StepResult::indeterminate_without_diagnostic(
+                    "stack effect unavailable for a do-while loop",
+                ),
                 Op::Repeat { count, body, .. } => {
                     self.analyze_repeat(procedure, range, count.expect_value(), body, state)
                 }
@@ -914,10 +893,14 @@ impl Analyzer {
         use Instruction::*;
 
         match inst.inner() {
-            Nop | Debug(_) | DebugVar(_) | Trace(_) | SysEvent(_) | Emit => {
+            Nop | DebugVar(_) | DebugInlineCall(_) | DebugInlineCallClear | SysEvent(_)
+            | EmitImm(_) | TraceImm(_) => {
                 StepResult::continue_with(state, 0, 0, &format!("`{}`", inst.inner()))
             }
-            EmitImm(_) => StepResult::continue_with(state, 0, 0, "immediate `emit`"),
+            Emit | Trace => {
+                state.peek_many(1);
+                StepResult::continue_with(state, 1, 1, "dynamic event")
+            }
             Push(immediate) => {
                 let value = immediate.expect_value();
                 match value {
@@ -975,8 +958,8 @@ impl Analyzer {
                 state.set_top_many(4, (0..4).map(|_| Value::Unknown));
                 StepResult::continue_with(state, 4, 4, "`caller`")
             }
-            AdvPush(count) => {
-                let count = count.expect_value() as usize;
+            AdvPush => {
+                let count = 1usize;
                 state.push_many((0..count).map(|_| Value::Unknown));
                 StepResult::continue_with(state, 0, count, "`adv.push`")
             }
@@ -1078,7 +1061,7 @@ impl Analyzer {
                 state.set_top_many(13, (0..13).map(|_| Value::Unknown));
                 StepResult::continue_with(state, 13, 13, &format!("`{}`", inst.inner()))
             }
-            FriExt2Fold4 | HornerBase | HornerExt | EvalCircuit | LogPrecompile => {
+            FriExt2Fold4 | HornerBase | HornerExt | EvalCircuit => {
                 StepResult::indeterminate_without_diagnostic(&format!(
                     "stack effect unsupported for `{}`",
                     inst.inner()

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Rebuild parsing, symbol indexing, and module discovery on the VM 0.36.2 assembler's lossless CST and module APIs, removing Tree-sitter dependencies.
+- Validate MASM projects through the project assembler using unsaved editor buffers, and resolve compiled dependencies through unified package debug information.
+- Load toolchain packages from a configured sysroot or `MIDEN_SYSROOT`, with guidance for incompatible package formats.
+
+### Fixed
+
+- Keep document text and syntax trees synchronized when an incremental edit is invalid, and reject positions splitting UTF-16 surrogate pairs.
+- Distinguish source locations of procedures that share the same executable MAST digest.
+
 ## [0.1.2](https://github.com/0xMiden/miden-lsp/compare/v0.1.1...v0.1.2) - 2026-04-23
 
 ### Other
