@@ -24,10 +24,15 @@ impl Server {
     }
 
     fn spawn(mut command: Command) -> Self {
-        let mut child = command
+        command
             .env_remove("MIDEN_SYSROOT")
             .env_remove("MIDENUP_HOME")
-            .env_remove("MIDENUP_TOOLCHAIN")
+            .env_remove("MIDENUP_TOOLCHAIN");
+        Self::spawn_configured(command)
+    }
+
+    fn spawn_configured(mut command: Command) -> Self {
+        let mut child = command
             .env("RUST_MIN_STACK", "16777216")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -51,6 +56,8 @@ impl Server {
                     }
                     if let Some(value) = line.strip_prefix("Content-Length:") {
                         length = value.trim().parse::<usize>().ok();
+                    } else {
+                        assert!(line.starts_with("Content-Type:"), "non-protocol stdout: {line:?}");
                     }
                 }
                 let Some(length) = length else { return };
@@ -301,9 +308,8 @@ fn toolchain_dispatch_keeps_the_stdio_protocol_intact() {
     let arguments = root.path().join("arguments");
     std::fs::write(
         &wrapper,
-        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$MIDEN_LSP_TEST_ARGUMENTS\"\n[ \"$1\" = '+0.18.0' ] \
-         || exit 2\n[ \"$2\" = 'miden-lsp' ] || exit 3\nshift 2\nexec \"$MIDEN_LSP_TEST_SERVER\" \
-         \"$@\"\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$MIDEN_LSP_TEST_ARGUMENTS\"\n[ \"$1\" = 'miden-lsp' \
+         ] || exit 2\nshift\nexec \"$MIDEN_LSP_TEST_SERVER\" \"$@\"\n",
     )
     .unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -319,10 +325,118 @@ fn toolchain_dispatch_keeps_the_stdio_protocol_intact() {
     server.initialize(&[root.path()], json!({}));
     let arguments = std::fs::read_to_string(arguments).unwrap();
     assert!(
-        arguments.starts_with("+0.18.0\nmiden-lsp\n--no-toolchain-dispatch\n--project\n"),
+        arguments.starts_with("miden-lsp\n--no-toolchain-dispatch\n--project\n"),
         "{arguments}"
     );
     server.finish();
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires MIDEN_LSP_TEST_MIDENUP pointing to a real midenup executable"]
+fn real_midenup_installs_and_dispatches_the_server_with_package_navigation() {
+    use std::os::unix::fs::symlink;
+
+    use miden_core::serde::Serializable;
+
+    let manager = std::env::var_os("MIDEN_LSP_TEST_MIDENUP")
+        .map(std::path::PathBuf::from)
+        .expect("set MIDEN_LSP_TEST_MIDENUP to the real midenup executable")
+        .canonicalize()
+        .unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let application = root.path().join("project");
+    let text = "use dep\npub proc entry() -> u32\nadv_push\npush.1\nu32wrapping_add\nend\npub \
+                proc main\nexec.dep::helper\nend\n";
+    project(&application, text);
+    let manifest = application.join("miden-project.toml");
+    let mut manifest_text = std::fs::read_to_string(&manifest).unwrap();
+    manifest_text.push_str("[dependencies]\ndep = \"1.0.0\"\n");
+    std::fs::write(manifest, manifest_text).unwrap();
+    std::fs::write(
+        application.join("miden-toolchain.toml"),
+        "[toolchain]\nchannel = \"0.18.0\"\ncomponents = [\"miden-lsp\", \"dep\"]\nprofile = \
+         \"minimal\"\n",
+    )
+    .unwrap();
+    let mut dependency = miden_assembly::Assembler::default()
+        .assemble_library(
+            "dep",
+            "namespace dep\npub proc helper\npush.1 drop\nend\n",
+            core::iter::empty::<&str>(),
+        )
+        .unwrap();
+    dependency.version = "1.0.0".parse().unwrap();
+    let artifact = root.path().join("dep.masp");
+    std::fs::write(&artifact, dependency.to_bytes()).unwrap();
+    let upstream = root.path().join("manifest.json");
+    let mut upstream_manifest = json!({
+        "manifest_version":"3.0.0", "min_client_version":"1.3.0", "date":1793318400,
+        "networks":{"devnet":"0.18.0", "mainnet":"0.18.0", "testnet":"0.18.0"},
+        "channels":[{"name":"0.18.0", "components":[{
+            "name":"miden-lsp", "kind":"executable",
+            "version":{"kind":"registry", "version":"0.1.2"},
+            "installation_method":{"kind":"prebuilt"},
+            "installed-executable":"miden-lsp", "profiles":["complete"],
+            "artifacts":{"miden-lsp":{"uri":Url::from_file_path(env!("CARGO_BIN_EXE_miden-lsp")).unwrap()}}
+        }, {
+            "name":"dep", "kind":"package",
+            "version":{"kind":"registry", "version":"1.0.0"},
+            "profiles":["minimal"],
+            "artifacts":{"dep.masp":{"uri":Url::from_file_path(&artifact).unwrap()}}
+        }]}]
+    });
+    let mut other_channel = upstream_manifest["channels"][0].clone();
+    other_channel["name"] = json!("0.19.0");
+    other_channel["components"][0]["profiles"] = json!(["minimal"]);
+    upstream_manifest["channels"].as_array_mut().unwrap().push(other_channel);
+    std::fs::write(&upstream, serde_json::to_vec(&upstream_manifest).unwrap()).unwrap();
+    let cargo_home = root.path().join("cargo");
+    let bin = cargo_home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    symlink(&manager, bin.join("midenup")).unwrap();
+    symlink(&manager, bin.join("miden")).unwrap();
+    let home = root.path().join("midenup");
+    for (override_channel, expected_channel) in [(None, "0.18.0"), (Some("0.19.0"), "0.19.0")] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_miden-lsp"));
+        if let Some(channel) = override_channel {
+            command.args(["--toolchain", channel]);
+        }
+        command
+            .arg("--project")
+            .arg(&application)
+            .arg("--miden")
+            .arg(bin.join("miden"))
+            .env_remove("MIDEN_SYSROOT")
+            .env_remove("MIDENUP_TOOLCHAIN")
+            .env("MIDENUP_HOME", &home)
+            .env("CARGO_HOME", &cargo_home)
+            .env("MIDENUP_MANIFEST_URI", Url::from_file_path(&upstream).unwrap().as_str());
+        let mut server = Server::spawn_configured(command);
+        server.initialize(&[&application], json!({}));
+        let source = application.join("mod.masm");
+        server.open(&source, text);
+        let findings = server.diagnostics(&source, 1);
+        assert!(
+            findings.as_array().unwrap().iter().any(|finding| {
+                finding["source"] == "miden-compiler"
+                    && finding["message"].as_str().unwrap().contains("unconstrained")
+            }),
+            "{findings:#}"
+        );
+        let definition = server.request("textDocument/definition", json!({"textDocument":{"uri":Url::from_file_path(&source).unwrap()}, "position":{"line":7,"character":11}}));
+        let target =
+            Url::parse(definition["uri"].as_str().unwrap()).unwrap().to_file_path().unwrap();
+        assert!(
+            target.starts_with(
+                home.join("toolchains").join(expected_channel).canonicalize().unwrap()
+            )
+        );
+        assert_eq!(target.file_name().unwrap(), "dep.masp");
+        assert!(home.join("state.json").is_file());
+        assert!(!application.join("target").exists());
+        server.finish();
+    }
 }
 
 #[test]

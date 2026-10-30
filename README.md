@@ -108,11 +108,14 @@ miden-lsp --project /path/to/project
 miden-lsp --project /path/to/project --toolchain 0.18.0
 ```
 
-The nearest `miden-toolchain.toml` selects the server through
-`miden +CHANNEL miden-lsp`, preserving the stdio connection. The toolchain must
+The nearest `miden-toolchain.toml` selects the server through `miden miden-lsp`
+running in the project directory, preserving the stdio connection. The toolchain must
 provide the `miden-lsp` component; midenup handles component selection and
 installation according to its normal policy. `--miden` selects a non-default
-midenup wrapper executable. For development with an unpublished server build:
+midenup wrapper executable. Include `miden-lsp` in the toolchain file's
+`components` list if the selected profile does not include it. Toolchain selection
+uses the project file so midenup retains its component, profile, and patch settings.
+For development with an unpublished server build:
 
 ```sh
 cargo run -- --no-toolchain-dispatch --project /path/to/project
@@ -123,6 +126,20 @@ packages. Registries are cached separately and refreshed when artifacts change.
 Incompatible package formats produce a matching-toolchain diagnostic; selecting
 a sysroot does not translate package formats. Use separate server instances for
 projects requiring incompatible VM generations.
+
+### Real editor integration test
+
+After building the server and running `npm run compile` in `../vscode-extension`:
+
+```sh
+node tools/test-vscode.mjs --code /path/to/Code --midenup /path/to/midenup \
+  --lsp /path/to/miden-lsp --extension ../vscode-extension
+```
+
+This uses a real VS Code Extension Host and midenup 1.3 or later, with
+isolated settings, toolchains, and a local manifest for the unpublished server.
+It checks cold installation, diagnostics, navigation, unsaved edits, file watching,
+restart, and shutdown without changing your normal editor or toolchain setup.
 
 ### Compiler analysis and diagnostics
 

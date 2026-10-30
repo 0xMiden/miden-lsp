@@ -22,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Preserve midenup's project-specific component, profile, and patch settings when
+  dispatching the language server.
 - Exit promptly after the LSP exit notification without waiting for stdin EOF.
 - Resolve declared submodule names in navigation and stack-effect analysis.
 - Keep document text and syntax trees synchronized when an incremental edit is invalid, and reject positions splitting UTF-16 surrogate pairs.

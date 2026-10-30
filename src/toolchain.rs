@@ -59,8 +59,11 @@ pub fn dispatch(
     miden: &Path,
 ) -> Result<std::process::ExitStatus, String> {
     validate_channel(channel)?;
-    Command::new(miden)
-        .arg(format!("+{channel}"))
+    let mut command = Command::new(miden);
+    if project_channel(project)?.as_deref() != Some(channel) {
+        command.arg(format!("+{channel}")).env("MIDEN_LSP_TOOLCHAIN_OVERRIDE", channel);
+    }
+    command
         .arg("miden-lsp")
         .arg("--no-toolchain-dispatch")
         .arg("--project")
@@ -86,7 +89,12 @@ pub(crate) fn registry_for_document(
     if options.sysroot.is_some() {
         return default.select(options);
     }
-    let Some(channel) = project_channel(document)? else {
+    let channel = std::env::var("MIDEN_LSP_TOOLCHAIN_OVERRIDE")
+        .ok()
+        .map(Some)
+        .map(Ok)
+        .unwrap_or_else(|| project_channel(document))?;
+    let Some(channel) = channel else {
         if let Some(sysroot) = std::env::var_os("MIDEN_SYSROOT").filter(|path| !path.is_empty()) {
             let mut selected = options.clone();
             selected.sysroot = Some(sysroot.into());
