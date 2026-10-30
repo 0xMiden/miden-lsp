@@ -21,6 +21,10 @@ Current server functionality includes:
 - Project-assembler diagnostics for unresolved symbols and invalid modules
 - Project diagnostics for manifest loading and validation failures
 - Stack-effect diagnostics for unbalanced control flow and indeterminate callees
+- Compiler-backed, interprocedural HIR analysis for unconstrained advice values
+- Semantic warnings even when project assembly succeeds
+- Toolchain-aware startup and independent package registries for workspace roots
+- Refresh diagnostics after source, manifest, toolchain, or package changes
 - Document symbols and workspace symbols
 - Go-to-definition across local source, workspace members, and dependencies
 - Hover for local and dependency symbols, including metadata-backed signatures and
@@ -74,12 +78,13 @@ Or run the built binary directly:
 
 ### Initialization Options
 
-The server currently supports the following initialization options:
+The server supports the following initialization options:
 
 ```json
 {
   "registryArtifacts": ["/abs/path/to/package-a.masp", "/abs/path/to/package-b.masp"],
   "gitCacheRoot": "/abs/path/to/git-cache",
+  "midenupHome": "/abs/path/to/midenup",
   "sysroot": "/abs/path/to/miden-toolchain"
 }
 ```
@@ -87,15 +92,55 @@ The server currently supports the following initialization options:
 - `registryArtifacts`: preassembled `.masp` artifacts to load into the in-memory
   registry used for registry-backed dependency resolution
 - `gitCacheRoot`: optional directory for cached git dependencies
+- `midenupHome`: optional midenup installation directory; otherwise `MIDENUP_HOME`
+  or `midenup show home` is used when a project declares a toolchain
 - `sysroot`: optional toolchain directory; packages in its `lib/` directory are
   available to dependency resolution. Defaults to `MIDEN_SYSROOT` when launched
-  through midenup. No toolchains are downloaded or switched by the server.
+  through midenup when no project-specific toolchain is declared. An explicit
+  initialization option takes precedence over project and environment settings.
 
-This server uses VM 0.36.2 APIs. Run the server and use packages from a compatible
-toolchain; selecting a sysroot does not make incompatible package formats readable.
-Compiler-HIR/disassembler analysis and success-with-warning reporting from the
-upstream diagnostics rewrite remain follow-up work. The existing conservative
-AST stack analysis is retained; unsupported effects are not assumed to be balanced.
+### Toolchains
+
+Start from a project directory, or pass it explicitly:
+
+```sh
+miden-lsp --project /path/to/project
+miden-lsp --project /path/to/project --toolchain 0.18.0
+```
+
+The nearest `miden-toolchain.toml` selects the server through
+`miden +CHANNEL miden-lsp`, preserving the stdio connection. The toolchain must
+provide the `miden-lsp` component; midenup handles component selection and
+installation according to its normal policy. `--miden` selects a non-default
+midenup wrapper executable. For development with an unpublished server build:
+
+```sh
+cargo run -- --no-toolchain-dispatch --project /path/to/project
+```
+
+Within a multi-root workspace, each project's declared toolchain supplies its own
+packages. Registries are cached separately and refreshed when artifacts change.
+Incompatible package formats produce a matching-toolchain diagnostic; selecting
+a sysroot does not translate package formats. Use separate server instances for
+projects requiring incompatible VM generations.
+
+### Compiler analysis and diagnostics
+
+The server uses the compiler's MASM disassembler and HIR dataflow solver directly,
+with project dependency metadata and unsaved source buffers. Unconstrained advice
+findings are reported at their source spans. Unsupported procedures and exhausted
+analysis budgets produce explicit warnings, not a clean-analysis claim. Analysis
+does not build Rust projects or write compiled artifacts into the project tree.
+
+Compiler libraries are pinned to a compatible upstream revision until their next
+release; the Rust toolchain is pinned accordingly. The existing conservative stack
+visualization remains alongside the compiler's dataflow diagnostics.
+
+VM 0.36 does not expose a successful-parse diagnostic sink yet. The adapter collects
+semantic warnings through warning-as-error parsing, preserves their warning
+severity, and retains the separately successful assembly result. It also preserves
+diagnostic codes, help, source URIs, and UTF-16 editor ranges. This does not depend
+on the still-unreleased upstream diagnostics rewrite.
 
 ### Editor Integrations
 
@@ -129,7 +174,7 @@ The core server is in place, but there are several areas worth exploring next:
 
 ## Status
 
-The server implementation is backed by automated Rust tests and in-repo editor
-extension scaffolds for Zed and VS Code. The main remaining validation gap is
-manual smoke testing against real MASM-only and mixed Rust/Miden projects in the
-target editors.
+Tests include real server processes over stdio: compiler warnings and unsaved
+fixes, dependency edits, file watcher registration, multi-root toolchain selection,
+midenup dispatch, and shutdown without closing stdin. Run them with `cargo test
+--locked --all-targets`. Manual VS Code and Zed smoke testing remains release QA.

@@ -67,12 +67,19 @@ pub struct InitializationOptions {
     pub registry_artifacts: Vec<PathBuf>,
     pub git_cache_root: Option<PathBuf>,
     pub sysroot: Option<PathBuf>,
+    pub midenup_home: Option<PathBuf>,
 }
 
 #[derive(Default)]
 pub struct RegistryState {
     registry: InMemoryPackageRegistry,
     artifacts: BTreeMap<(PackageId, Version), PathBuf>,
+    selections: std::sync::Mutex<BTreeMap<Option<PathBuf>, CachedRegistry>>,
+}
+
+struct CachedRegistry {
+    files: Vec<(PathBuf, u64, std::time::SystemTime)>,
+    state: Arc<RegistryState>,
 }
 
 impl RegistryState {
@@ -106,7 +113,11 @@ impl RegistryState {
                 format!("failed to read '{}': {error}", artifact_path.display())
             })?;
             let package = Arc::new(MastPackage::read_from_bytes(&bytes).map_err(|error| {
-                format!("failed to decode '{}': {error}. Use miden-lsp from the same midenup toolchain as the package, or select a compatible sysroot", artifact_path.display())
+                format!(
+                    "failed to decode '{}': {error}. Use miden-lsp from the same midenup \
+                     toolchain as the package, or select a compatible sysroot",
+                    artifact_path.display()
+                )
             })?);
             let name = package.name.clone();
             let version = state
@@ -121,6 +132,60 @@ impl RegistryState {
 
     pub fn registry(&self) -> &InMemoryPackageRegistry {
         &self.registry
+    }
+
+    pub(crate) fn select(&self, options: &InitializationOptions) -> Result<Arc<Self>, String> {
+        let key = options.sysroot.as_deref().map(normalize_path);
+        let mut paths = options.registry_artifacts.clone();
+        if let Some(sysroot) = &options.sysroot {
+            for entry in fs::read_dir(sysroot.join("lib")).map_err(|error| {
+                format!("cannot read toolchain '{}': {error}", sysroot.display())
+            })? {
+                let path = entry.map_err(|error| error.to_string())?.path();
+                if path.is_file() && path.extension().is_some_and(|extension| extension == "masp") {
+                    paths.push(path);
+                }
+            }
+        }
+        paths.sort();
+        paths.dedup();
+        let files = paths
+            .into_iter()
+            .map(|path| {
+                let metadata = fs::metadata(&path).map_err(|error| error.to_string())?;
+                let modified = metadata.modified().map_err(|error| error.to_string())?;
+                Ok((path, metadata.len(), modified))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        if let Some(cached) = self
+            .selections
+            .lock()
+            .map_err(|_| "toolchain registry lock poisoned")?
+            .get(&key)
+            && cached.files == files
+        {
+            return Ok(cached.state.clone());
+        }
+        let state = Arc::new(Self::from_options(options)?);
+        let mut selections =
+            self.selections.lock().map_err(|_| "toolchain registry lock poisoned")?;
+        if !selections.contains_key(&key) && selections.len() >= 16 {
+            selections.pop_first();
+        }
+        selections.insert(
+            key,
+            CachedRegistry {
+                files,
+                state: state.clone(),
+            },
+        );
+        Ok(state)
+    }
+
+    pub(crate) fn invalidate_selections(&self) {
+        if let Ok(mut selections) = self.selections.lock() {
+            selections.clear();
+        }
     }
 
     pub(crate) fn assembly_cache(&self) -> Result<InMemoryPackageRegistry, String> {
@@ -1585,6 +1650,20 @@ fn analyze_source_module(
         }
         let docs = take_docs(&mut pending_docs);
         match cst::Item::cast(child) {
+            Some(cst::Item::Submodule(declaration)) => {
+                if let Some(name) = declaration.name_token() {
+                    module.imports.insert(
+                        name.text().trim_matches('"').to_string(),
+                        ImportAlias {
+                            target: AliasTarget::Path(format!(
+                                "{}::{}",
+                                module.module_path,
+                                name.text()
+                            )),
+                        },
+                    );
+                }
+            }
             Some(cst::Item::Import(import)) => parse_import(&mut module, &import, parsed)?,
             Some(cst::Item::Constant(constant)) => {
                 if let Some(name) = constant.name_token() {
@@ -3036,11 +3115,43 @@ mod tests {
     }
 
     #[test]
+    fn known_submodule_bodies_have_determinate_stack_effects() {
+        let root = temp_dir("submodule-stack-effects");
+        write_file(
+            &root.join("miden-project.toml"),
+            "[package]\nname = \"app\"\nversion = \"1.0.0\"\n[lib]\npath = \
+             \"mod.masm\"\nnamespace = \"app\"\n",
+        );
+        let source = root.join("mod.masm");
+        write_file(&source, "pub mod child\npub proc main\nexec.child::target\nend\n");
+        write_file(&root.join("child.masm"), "pub proc target\npush.1 drop\nend\n");
+        let snapshot = ProjectSnapshot::load_for_document(
+            &source,
+            &OverlayMap::default(),
+            &RegistryState::default(),
+            None,
+        )
+        .unwrap();
+        let diagnostics = snapshot.semantic_diagnostics(&source);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        assert_eq!(
+            snapshot
+                .definition_at(&source, Position::new(2, 12))
+                .unwrap()
+                .uri
+                .to_file_path()
+                .unwrap(),
+            root.join("child.masm").canonicalize().unwrap()
+        );
+    }
+
+    #[test]
     fn recovers_symbols_after_an_incomplete_declaration() {
         let root = temp_dir("incomplete-cst");
         write_file(
             &root.join("miden-project.toml"),
-            "[package]\nname = \"app\"\nversion = \"1.0.0\"\n[lib]\npath = \"mod.masm\"\nnamespace = \"app\"\n",
+            "[package]\nname = \"app\"\nversion = \"1.0.0\"\n[lib]\npath = \
+             \"mod.masm\"\nnamespace = \"app\"\n",
         );
         let source = root.join("mod.masm");
         let text = "pub const = 1\npub proc kept\npush.1\nend\n";
@@ -3066,10 +3177,12 @@ mod tests {
         let root = temp_dir("item-imports");
         write_file(
             &root.join("miden-project.toml"),
-            "[package]\nname = \"app\"\nversion = \"1.0.0\"\n[lib]\npath = \"mod.masm\"\nnamespace = \"app\"\n",
+            "[package]\nname = \"app\"\nversion = \"1.0.0\"\n[lib]\npath = \
+             \"mod.masm\"\nnamespace = \"app\"\n",
         );
         let source = root.join("mod.masm");
-        let text = "use {helper as renamed} from app::child\npub mod child\npub proc main\nexec.renamed\nend\n";
+        let text = "use {helper as renamed} from app::child\npub mod child\npub proc \
+                    main\nexec.renamed\nend\n";
         write_file(&source, text);
         write_file(&root.join("child.masm"), "pub proc helper\npush.1 drop\nend\n");
         let snapshot = ProjectSnapshot::load_for_document(
@@ -3127,7 +3240,8 @@ mod tests {
         let dependency_source = root.join("dependency with space.masm");
         write_file(
             &dependency_source,
-            "namespace dep\n#! documentation\npub proc helper\npush.1 drop\nend\npub proc other\npush.1 drop\nend\n",
+            "namespace dep\n#! documentation\npub proc helper\npush.1 drop\nend\npub proc \
+             other\npush.1 drop\nend\n",
         );
         let mut package = miden_assembly::Assembler::default()
             .assemble_library("dep", dependency_source.as_path(), core::iter::empty::<&str>())
@@ -3149,7 +3263,8 @@ mod tests {
         let app = root.join("app");
         write_file(
             &app.join("miden-project.toml"),
-            "[package]\nname = \"app\"\nversion = \"1.0.0\"\n[lib]\npath = \"mod.masm\"\nnamespace = \"app\"\n[dependencies]\ndep = { path = \"../dep.masp\" }\n",
+            "[package]\nname = \"app\"\nversion = \"1.0.0\"\n[lib]\npath = \
+             \"mod.masm\"\nnamespace = \"app\"\n[dependencies]\ndep = { path = \"../dep.masp\" }\n",
         );
         let source = app.join("mod.masm");
         let text = "use dep\npub proc main\nexec.dep::other\nend\n";
@@ -3712,6 +3827,7 @@ end
             registry_artifacts: vec![artifact_path.clone()],
             git_cache_root: None,
             sysroot: None,
+            midenup_home: None,
         })
         .unwrap();
 

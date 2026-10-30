@@ -10,16 +10,17 @@ use tower_lsp::{
     jsonrpc::Result,
     lsp_types::{
         CodeLens, CodeLensOptions, CodeLensParams, CompletionOptions, CompletionParams,
-        CompletionResponse, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
+        CompletionResponse, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
+        DidChangeWatchedFilesRegistrationOptions, DidCloseTextDocumentParams,
         DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentSymbolParams,
-        ExecuteCommandOptions, ExecuteCommandParams, GotoDefinitionParams, GotoDefinitionResponse,
-        Hover, HoverParams, InitializeParams, InitializeResult, InitializedParams, InlayHint,
-        InlayHintOptions, InlayHintParams, InlayHintServerCapabilities, MessageType, OneOf,
-        PrepareRenameResponse, ReferenceParams, RenameOptions, RenameParams,
-        SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams,
-        SemanticTokensResult, ServerCapabilities, TextDocumentPositionParams,
-        TextDocumentSyncCapability, TextDocumentSyncKind, Url, WorkspaceEdit, WorkspaceFolder,
-        WorkspaceSymbolParams,
+        ExecuteCommandOptions, ExecuteCommandParams, FileSystemWatcher, GlobPattern,
+        GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams, InitializeParams,
+        InitializeResult, InitializedParams, InlayHint, InlayHintOptions, InlayHintParams,
+        InlayHintServerCapabilities, MessageType, OneOf, PrepareRenameResponse, ReferenceParams,
+        Registration, RenameOptions, RenameParams, SemanticTokensFullOptions,
+        SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult, ServerCapabilities,
+        TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
+        WorkspaceEdit, WorkspaceFolder, WorkspaceSymbolParams,
     },
 };
 
@@ -37,6 +38,9 @@ struct ServerState {
     git_cache_root: Option<PathBuf>,
     registry: Arc<RegistryState>,
     workspace_folders: Vec<PathBuf>,
+    options: InitializationOptions,
+    generation: u64,
+    dynamic_file_watching: bool,
 }
 
 impl ServerState {
@@ -57,6 +61,7 @@ impl ServerState {
 pub struct Backend {
     client: Client,
     state: Arc<RwLock<ServerState>>,
+    analysis_gate: Arc<tokio::sync::Semaphore>,
 }
 
 impl Backend {
@@ -64,11 +69,15 @@ impl Backend {
         Self {
             client,
             state: Arc::new(RwLock::new(ServerState::default())),
+            analysis_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 
     async fn publish_diagnostics(&self, uri: Url, include_project: bool) {
-        let (version, mut diagnostics, overlays, registry, git_cache_root) = {
+        let Ok(permit) = self.analysis_gate.clone().acquire_owned().await else {
+            return;
+        };
+        let (version, mut diagnostics, overlays, registry, git_cache_root, options, generation) = {
             let state = self.state.read().await;
             let Some(document) = state.documents.get(&uri) else {
                 return;
@@ -79,12 +88,29 @@ impl Backend {
                 state.overlays(),
                 state.registry.clone(),
                 state.git_cache_root.clone(),
+                state.options.clone(),
+                state.generation,
             )
         };
         let syntax_valid = diagnostics.is_empty();
         if let Ok(path) = uri.to_file_path() {
+            if self.state.read().await.generation != generation {
+                return;
+            }
             let analysis = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
                 let mut diagnostics = Vec::new();
+                let registry =
+                    match crate::toolchain::registry_for_document(&options, &registry, &path) {
+                        Ok(registry) => registry,
+                        Err(error) => {
+                            return vec![crate::diagnostics::notice(
+                                error,
+                                tower_lsp::lsp_types::DiagnosticSeverity::ERROR,
+                                "miden-toolchain",
+                            )];
+                        }
+                    };
                 match ProjectSnapshot::load_for_document(
                     &path,
                     &overlays,
@@ -95,8 +121,12 @@ impl Backend {
                         diagnostics.extend(snapshot.semantic_diagnostics(&path));
                         if syntax_valid {
                             match registry.assembly_cache() {
-                                Ok(cache) => diagnostics
-                                    .extend(crate::project::diagnostics(&path, &overlays, cache)),
+                                Ok(cache) => diagnostics.extend(crate::project::diagnostics(
+                                    &path,
+                                    &overlays,
+                                    cache,
+                                    git_cache_root.as_deref(),
+                                )),
                                 Err(error) => {
                                     tracing::warn!(%error, "unable to prepare assembler cache")
                                 }
@@ -120,13 +150,9 @@ impl Backend {
                 Err(error) => tracing::error!(%error, "project analysis failed"),
             }
         }
-        if self
-            .state
-            .read()
-            .await
-            .documents
-            .get(&uri)
-            .is_some_and(|document| document.version() == version)
+        let state = self.state.read().await;
+        if state.generation == generation
+            && state.documents.get(&uri).is_some_and(|document| document.version() == version)
         {
             self.client.publish_diagnostics(uri, diagnostics, Some(version)).await;
         }
@@ -134,11 +160,18 @@ impl Backend {
 
     async fn snapshot_for_path(&self, path: &Path) -> Option<ProjectSnapshot> {
         let path = normalize_path(path);
-        let (overlays, registry, git_cache_root) = {
+        let (overlays, registry, git_cache_root, options) = {
             let state = self.state.read().await;
-            (state.overlays(), state.registry.clone(), state.git_cache_root.clone())
+            (
+                state.overlays(),
+                state.registry.clone(),
+                state.git_cache_root.clone(),
+                state.options.clone(),
+            )
         };
         tokio::task::spawn_blocking(move || {
+            let registry =
+                crate::toolchain::registry_for_document(&options, &registry, &path).ok()?;
             ProjectSnapshot::load_for_document(
                 &path,
                 &overlays,
@@ -151,19 +184,29 @@ impl Backend {
         .ok()
         .flatten()
     }
+
+    async fn refresh_open_documents(&self) {
+        let documents = self.state.read().await.documents.keys().cloned().collect::<Vec<_>>();
+        for uri in documents {
+            self.publish_diagnostics(uri, true).await;
+        }
+    }
 }
 
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
-        let mut options = params
+        let dynamic_file_watching = params
+            .capabilities
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.did_change_watched_files.as_ref())
+            .and_then(|watching| watching.dynamic_registration)
+            .unwrap_or(false);
+        let options = params
             .initialization_options
             .and_then(|value| serde_json::from_value::<InitializationOptions>(value).ok())
             .unwrap_or_default();
-
-        if options.sysroot.is_none() {
-            options.sysroot = std::env::var_os("MIDEN_SYSROOT").map(PathBuf::from);
-        }
 
         let workspace_folders = params
             .workspace_folders
@@ -177,9 +220,11 @@ impl LanguageServer for Backend {
             .map_err(tower_lsp::jsonrpc::Error::invalid_params)?;
 
         let mut state = self.state.write().await;
-        state.git_cache_root = options.git_cache_root;
+        state.git_cache_root = options.git_cache_root.clone();
+        state.options = options;
         state.registry = Arc::new(registry);
         state.workspace_folders = workspace_folders;
+        state.dynamic_file_watching = dynamic_file_watching;
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
@@ -229,6 +274,37 @@ impl LanguageServer for Backend {
 
     async fn initialized(&self, _: InitializedParams) {
         self.client.log_message(MessageType::INFO, "miden-lsp initialized").await;
+        let dynamic_file_watching = self.state.read().await.dynamic_file_watching;
+        if dynamic_file_watching {
+            let options = DidChangeWatchedFilesRegistrationOptions {
+                watchers: [
+                    "**/*.masm",
+                    "**/*.masp",
+                    "**/miden-project.toml",
+                    "**/miden-toolchain.toml",
+                ]
+                .into_iter()
+                .map(|pattern| FileSystemWatcher {
+                    glob_pattern: GlobPattern::String(pattern.into()),
+                    kind: None,
+                })
+                .collect(),
+            };
+            if let Err(error) = self
+                .client
+                .register_capability(vec![Registration {
+                    id: "miden-project-files".into(),
+                    method: "workspace/didChangeWatchedFiles".into(),
+                    register_options: Some(
+                        serde_json::to_value(options)
+                            .expect("file watcher options are serializable"),
+                    ),
+                }])
+                .await
+            {
+                tracing::warn!(%error, "client declined project file watching");
+            }
+        }
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -239,8 +315,12 @@ impl LanguageServer for Backend {
         let document = params.text_document;
         match TextDocument::new(document.uri.clone(), document.version, document.text) {
             Ok(text_document) => {
-                self.state.write().await.documents.insert(document.uri.clone(), text_document);
-                self.publish_diagnostics(document.uri, true).await;
+                {
+                    let mut state = self.state.write().await;
+                    state.documents.insert(document.uri.clone(), text_document);
+                    state.generation += 1;
+                }
+                self.refresh_open_documents().await;
             }
             Err(error) => {
                 self.client.log_message(MessageType::ERROR, error).await;
@@ -255,7 +335,10 @@ impl LanguageServer for Backend {
         };
 
         match document.apply_changes(params.text_document.version, params.content_changes) {
-            Ok(()) => drop(state),
+            Ok(()) => {
+                state.generation += 1;
+                drop(state);
+            }
             Err(error) => {
                 drop(state);
                 self.client.log_message(MessageType::ERROR, error).await;
@@ -263,18 +346,33 @@ impl LanguageServer for Backend {
             }
         }
 
-        self.publish_diagnostics(params.text_document.uri, false).await;
+        self.refresh_open_documents().await;
     }
 
-    async fn did_save(&self, params: DidSaveTextDocumentParams) {
-        self.publish_diagnostics(params.text_document.uri, true).await;
+    async fn did_save(&self, _params: DidSaveTextDocumentParams) {
+        self.state.write().await.generation += 1;
+        self.refresh_open_documents().await;
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
-        self.state.write().await.documents.remove(&params.text_document.uri);
+        {
+            let mut state = self.state.write().await;
+            state.documents.remove(&params.text_document.uri);
+            state.generation += 1;
+        }
         self.client
             .publish_diagnostics(params.text_document.uri, Vec::new(), None)
             .await;
+        self.refresh_open_documents().await;
+    }
+
+    async fn did_change_watched_files(&self, _params: DidChangeWatchedFilesParams) {
+        {
+            let mut state = self.state.write().await;
+            state.generation += 1;
+            state.registry.invalidate_selections();
+        }
+        self.refresh_open_documents().await;
     }
 
     async fn document_symbol(
@@ -435,14 +533,36 @@ impl LanguageServer for Backend {
         &self,
         params: WorkspaceSymbolParams,
     ) -> Result<Option<Vec<tower_lsp::lsp_types::SymbolInformation>>> {
-        let state = self.state.read().await;
-        let symbols = ProjectSnapshot::workspace_symbols(
-            &state.workspace_folders,
-            &state.overlays(),
-            &state.registry,
-            state.git_cache_root.as_deref(),
-            &params.query,
-        );
+        let (folders, overlays, registry, options, git_cache_root) = {
+            let state = self.state.read().await;
+            (
+                state.workspace_folders.clone(),
+                state.overlays(),
+                state.registry.clone(),
+                state.options.clone(),
+                state.git_cache_root.clone(),
+            )
+        };
+        let symbols = tokio::task::spawn_blocking(move || {
+            let mut symbols = Vec::new();
+            for folder in folders {
+                let Ok(selected) =
+                    crate::toolchain::registry_for_document(&options, &registry, &folder)
+                else {
+                    continue;
+                };
+                symbols.extend(ProjectSnapshot::workspace_symbols(
+                    &[folder],
+                    &overlays,
+                    &selected,
+                    git_cache_root.as_deref(),
+                    &params.query,
+                ));
+            }
+            symbols
+        })
+        .await
+        .unwrap_or_default();
         Ok(Some(symbols))
     }
 
@@ -559,7 +679,8 @@ mod tests {
         let root = temp_dir("assembler-overlays");
         write_file(
             &root.join("miden-project.toml"),
-            "[package]\nname = \"app\"\nversion = \"1.0.0\"\n[lib]\npath = \"mod.masm\"\nnamespace = \"app\"\n",
+            "[package]\nname = \"app\"\nversion = \"1.0.0\"\n[lib]\npath = \
+             \"mod.masm\"\nnamespace = \"app\"\n",
         );
         let source = root.join("mod.masm");
         let valid = "pub proc main\npush.1 drop\nend\n";

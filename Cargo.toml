@@ -6,20 +6,28 @@ version = "0.1.2"
 edition = "2024"
 
 [dependencies]
-miden-assembly = "0.36.2"
-miden-assembly-syntax = "0.36.2"
-miden-assembly-syntax-cst = "0.36.2"
-miden-core = "0.36.2"
-miden-mast-package = "0.36.2"
-miden-package-registry = { version = "0.36.2", features = ["resolver"] }
-miden-project = "0.36.2"
+clap = { version = "4.5", features = ["derive"] }
+miden-assembly = "0.36.3"
+miden-assembly-syntax = "0.36.3"
+miden-assembly-syntax-cst = "0.36.3"
+miden-core = "0.36.3"
+miden-mast-package = "0.36.3"
+miden-package-registry = { version = "0.36.3", features = ["resolver"] }
+miden-project = "0.36.3"
+midenc-frontend-masm = { git = "https://github.com/0xMiden/compiler", rev = "f662b93a0c89a8241e9851f52026c0cfde376c3c" }
+midenc-hir = { git = "https://github.com/0xMiden/compiler", rev = "f662b93a0c89a8241e9851f52026c0cfde376c3c" }
+midenc-hir-analysis = { git = "https://github.com/0xMiden/compiler", rev = "f662b93a0c89a8241e9851f52026c0cfde376c3c" }
+midenc-dialect-hir = { git = "https://github.com/0xMiden/compiler", rev = "f662b93a0c89a8241e9851f52026c0cfde376c3c" }
+midenc-session = { git = "https://github.com/0xMiden/compiler", rev = "f662b93a0c89a8241e9851f52026c0cfde376c3c" }
+toml = "0.9"
+tempfile = "3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.50", features = ["io-std", "macros", "rt-multi-thread", "sync"] }
 tower-lsp = "0.20.0"
+tower = { version = "0.4", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
 futures = "0.3"
-tower = { version = "0.4", features = ["util"] }

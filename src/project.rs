@@ -12,17 +12,13 @@ use miden_assembly_syntax::{
         DefaultSourceManager, FileLineCol, Location, Selection, SourceContent, SourceFile,
         SourceId, SourceLanguage, SourceManager, SourceManagerError, SourceSpan, Uri,
     },
-    diagnostics::Diagnostic as MidenDiagnostic,
 };
 use miden_assembly_syntax_cst::ast::Item;
 use miden_package_registry::InMemoryPackageRegistry;
 use miden_project::Project;
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range, Url};
 
-use crate::{
-    analysis::{find_manifest_path, normalize_path},
-    document::{byte_range_to_lsp_range, compute_line_offsets},
-};
+use crate::analysis::{find_manifest_path, normalize_path};
 
 pub(crate) fn source_files(
     root: &Path,
@@ -121,9 +117,18 @@ pub(crate) fn source_files(
 }
 
 #[derive(Debug)]
-struct OverlaySourceManager {
+pub(crate) struct OverlaySourceManager {
     inner: DefaultSourceManager,
     overlays: BTreeMap<PathBuf, String>,
+}
+
+impl OverlaySourceManager {
+    pub(crate) fn new(overlays: BTreeMap<PathBuf, String>) -> Self {
+        Self {
+            inner: DefaultSourceManager::default(),
+            overlays,
+        }
+    }
 }
 
 impl SourceManager for OverlaySourceManager {
@@ -149,24 +154,31 @@ impl SourceManager for OverlaySourceManager {
     fn get(&self, id: SourceId) -> Result<Arc<SourceFile>, SourceManagerError> {
         self.inner.get(id)
     }
+
     fn find(&self, uri: &Uri) -> Option<SourceId> {
         self.inner.find(uri)
     }
+
     fn file_line_col_to_span(&self, location: FileLineCol) -> Option<SourceSpan> {
         self.inner.file_line_col_to_span(location)
     }
+
     fn file_line_col(&self, span: SourceSpan) -> Result<FileLineCol, SourceManagerError> {
         self.inner.file_line_col(span)
     }
+
     fn location_to_span(&self, location: Location) -> Option<SourceSpan> {
         self.inner.location_to_span(location)
     }
+
     fn location(&self, span: SourceSpan) -> Result<Location, SourceManagerError> {
         self.inner.location(span)
     }
+
     fn source(&self, id: SourceId) -> Result<&str, SourceManagerError> {
         self.inner.source(id)
     }
+
     fn source_slice(&self, span: SourceSpan) -> Result<&str, SourceManagerError> {
         self.inner.source_slice(span)
     }
@@ -176,6 +188,7 @@ pub(crate) fn diagnostics(
     document: &Path,
     overlays: &BTreeMap<PathBuf, String>,
     mut cache: InMemoryPackageRegistry,
+    git_cache_root: Option<&Path>,
 ) -> Vec<Diagnostic> {
     let Ok(manifest) = find_manifest_path(document) else {
         return Vec::new();
@@ -212,13 +225,46 @@ pub(crate) fn diagnostics(
         .or_else(|| std::fs::read_to_string(document).ok())
         .unwrap_or_default();
     let mut diagnostics = Vec::new();
-    for target in targets {
+    for selector in targets {
+        let target = match &selector {
+            ProjectTargetSelector::Library => project.library_target(),
+            ProjectTargetSelector::Executable(name) => project
+                .executable_targets()
+                .iter()
+                .find(|target| target.name.inner().as_ref() == *name),
+        };
+        if let Some(target) = target {
+            let root = project
+                .manifest_path()
+                .and_then(|manifest| manifest.parent())
+                .zip(target.path.to_path())
+                .map(|(directory, path)| directory.join(path));
+            let kind = if target.is_executable() {
+                ModuleKind::Executable
+            } else if target.is_kernel() {
+                ModuleKind::Kernel
+            } else {
+                ModuleKind::Library
+            };
+            if let Some(root) = root
+                && let Ok(files) = source_files(&root, target.namespace.inner(), kind, overlays)
+                && !files.iter().any(|(path, _)| *path == normalize_path(document))
+            {
+                continue;
+            }
+        }
         let result = Assembler::new(manager.clone())
             .for_project(project.clone(), &mut cache)
-            .and_then(|mut assembler| assembler.assemble(target, "dev"));
+            .and_then(|mut assembler| assembler.assemble(selector, "dev"));
         if let Err(error) = result {
             let previous = diagnostics.len();
-            collect_diagnostics(error.as_ref(), document, &text, &mut diagnostics);
+            crate::diagnostics::append(
+                error.as_ref(),
+                document,
+                &text,
+                "miden-assembler",
+                &mut diagnostics,
+            );
             if diagnostics.len() == previous {
                 diagnostics.push(Diagnostic {
                     range: Range::new(Position::new(0, 0), Position::new(0, 0)),
@@ -228,6 +274,15 @@ pub(crate) fn diagnostics(
                     ..Diagnostic::default()
                 });
             }
+        } else if let Some(target) = target {
+            diagnostics.extend(crate::compiler::analyze(
+                &project,
+                target.inner(),
+                document,
+                overlays,
+                &cache,
+                git_cache_root,
+            ));
         }
     }
     diagnostics.sort_by_key(|diagnostic| {
@@ -241,57 +296,22 @@ pub(crate) fn diagnostics(
     diagnostics
 }
 
-fn collect_diagnostics(
-    error: &dyn MidenDiagnostic,
-    document: &Path,
-    text: &str,
-    output: &mut Vec<Diagnostic>,
-) {
-    if let (Some(code), Some(labels)) = (error.source_code(), error.labels()) {
-        for label in labels {
-            let Ok(contents) = code.read_span(label.inner(), 0, 0) else {
-                continue;
-            };
-            let Some(name) = contents.name() else {
-                continue;
-            };
-            let path = Url::parse(name)
-                .ok()
-                .and_then(|uri| uri.to_file_path().ok())
-                .unwrap_or_else(|| PathBuf::from(name));
-            if normalize_path(&path) != normalize_path(document) {
-                continue;
-            }
-            let bounds = label.offset()..label.offset().saturating_add(label.len()).min(text.len());
-            output.push(Diagnostic {
-                range: byte_range_to_lsp_range(text, &compute_line_offsets(text), bounds),
-                severity: Some(DiagnosticSeverity::ERROR),
-                source: Some("miden-assembler".into()),
-                message: match label.label() {
-                    Some(label) => format!("{error}: {label}"),
-                    None => error.to_string(),
-                },
-                ..Diagnostic::default()
-            });
-        }
-    }
-    if let Some(related) = error.related() {
-        for error in related {
-            collect_diagnostics(error, document, text, output);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
 
     fn project(text: &str) -> PathBuf {
         let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let root = std::env::temp_dir().join(format!("miden-lsp-project-validation-{unique}"));
         std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("miden-project.toml"), "[package]\nname = \"app\"\nversion = \"1.0.0\"\n[lib]\npath = \"mod.masm\"\nnamespace = \"app\"\n").unwrap();
+        std::fs::write(
+            root.join("miden-project.toml"),
+            "[package]\nname = \"app\"\nversion = \"1.0.0\"\n[lib]\npath = \
+             \"mod.masm\"\nnamespace = \"app\"\n",
+        )
+        .unwrap();
         let source = root.join("mod.masm");
         std::fs::write(&source, text).unwrap();
         normalize_path(&source)
@@ -300,7 +320,8 @@ mod tests {
     #[test]
     fn project_assembler_reports_unresolved_calls_at_the_source_span() {
         let source = project("pub proc helper\n    exec.missing\nend\n");
-        let errors = diagnostics(&source, &BTreeMap::new(), InMemoryPackageRegistry::default());
+        let errors =
+            diagnostics(&source, &BTreeMap::new(), InMemoryPackageRegistry::default(), None);
         assert!(!errors.is_empty());
         assert!(
             errors
@@ -318,12 +339,12 @@ mod tests {
         let source = project("pub proc helper\n    exec.missing\nend\n");
         let valid = "pub proc helper\n    push.1 drop\nend\n";
         let overlays = BTreeMap::from([(source.clone(), valid.into())]);
-        let errors = diagnostics(&source, &overlays, InMemoryPackageRegistry::default());
+        let errors = diagnostics(&source, &overlays, InMemoryPackageRegistry::default(), None);
         assert!(errors.is_empty(), "{errors:?}");
         std::fs::write(&source, valid).unwrap();
         let overlays =
             BTreeMap::from([(source.clone(), "pub proc helper\nexec.unknown\nend\n".into())]);
-        let errors = diagnostics(&source, &overlays, InMemoryPackageRegistry::default());
+        let errors = diagnostics(&source, &overlays, InMemoryPackageRegistry::default(), None);
         assert!(!errors.is_empty());
         assert!(std::fs::read_to_string(source).unwrap().contains("push.1"));
     }
@@ -333,12 +354,199 @@ mod tests {
         let source = project("pub mod child\npub proc helper\nexec.child::target\nend\n");
         let child = source.parent().unwrap().join("child.masm");
         std::fs::write(&child, "pub proc target\nexec.missing\nend\n").unwrap();
-        let errors = diagnostics(&child, &BTreeMap::new(), InMemoryPackageRegistry::default());
+        let errors =
+            diagnostics(&child, &BTreeMap::new(), InMemoryPackageRegistry::default(), None);
         assert!(!errors.is_empty());
         let overlays =
             BTreeMap::from([(child.clone(), "pub proc target\npush.1 drop\nend\n".into())]);
-        let errors = diagnostics(&child, &overlays, InMemoryPackageRegistry::default());
+        let manager = Arc::new(OverlaySourceManager::new(overlays.clone()));
+        let package =
+            Project::load(source.parent().unwrap().join("miden-project.toml"), manager.as_ref())
+                .unwrap()
+                .package();
+        let mut cache = InMemoryPackageRegistry::default();
+        let assembled = Assembler::new(manager)
+            .for_project(package, &mut cache)
+            .and_then(|mut assembler| assembler.assemble(ProjectTargetSelector::Library, "dev"));
+        assert!(assembled.is_ok(), "{:?}", assembled.err());
+        let errors = diagnostics(&child, &overlays, InMemoryPackageRegistry::default(), None);
         assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn compiler_dataflow_reports_unconstrained_advice_after_successful_assembly() {
+        let source = project("pub proc entry() -> u32\nadv_push\npush.1\nu32wrapping_add\nend\n");
+        let findings =
+            diagnostics(&source, &BTreeMap::new(), InMemoryPackageRegistry::default(), None);
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.source.as_deref() == Some("miden-compiler")
+                    && finding.severity == Some(DiagnosticSeverity::WARNING)
+                    && finding.message.contains("unconstrained")
+                    && finding.range.start.line == 3),
+            "{findings:#?}"
+        );
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.severity == Some(DiagnosticSeverity::ERROR)),
+            "{findings:#?}"
+        );
+        assert!(!source.parent().unwrap().join("target").exists());
+    }
+
+    #[test]
+    fn compiler_dataflow_uses_unsaved_buffers_and_clears_fixed_findings() {
+        let unsafe_text = "pub proc entry() -> u32\nadv_push\npush.1\nu32wrapping_add\nend\n";
+        let source = project("pub proc entry() -> u32\npush.1\nend\n");
+        let overlays = BTreeMap::from([(source.clone(), unsafe_text.into())]);
+        let findings = diagnostics(&source, &overlays, InMemoryPackageRegistry::default(), None);
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.source.as_deref() == Some("miden-compiler")
+                    && finding.message.contains("unconstrained")),
+            "{findings:#?}"
+        );
+        let overlays = BTreeMap::from([(
+            source.clone(),
+            "pub proc entry() -> u32\nadv_push\nu32assert\npush.1\nu32wrapping_add\nend\n".into(),
+        )]);
+        let fixed = diagnostics(&source, &overlays, InMemoryPackageRegistry::default(), None);
+        assert!(fixed.is_empty(), "{fixed:#?}");
+        assert!(!std::fs::read_to_string(source).unwrap().contains("adv_push"));
+    }
+
+    #[test]
+    fn compiler_dataflow_follows_calls_into_source_dependencies() {
+        let source =
+            project("use dep\npub proc entry() -> u32\nadv_push\nexec.dep::consume\nend\n");
+        let root = source.parent().unwrap();
+        let manifest = root.join("miden-project.toml");
+        let mut text = std::fs::read_to_string(&manifest).unwrap();
+        text.push_str("[dependencies]\ndep = { path = \"dep\" }\n");
+        std::fs::write(manifest, text).unwrap();
+        std::fs::create_dir_all(root.join("dep")).unwrap();
+        std::fs::write(
+            root.join("dep/miden-project.toml"),
+            "[package]\nname = \"dep\"\nversion = \"1.0.0\"\n[lib]\npath = \
+             \"mod.masm\"\nnamespace = \"dep\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("dep/mod.masm"),
+            "pub proc consume\npush.1\nu32wrapping_add\nend\n",
+        )
+        .unwrap();
+        let findings =
+            diagnostics(&source, &BTreeMap::new(), InMemoryPackageRegistry::default(), None);
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.source.as_deref() == Some("miden-compiler")
+                    && finding.message.contains("unconstrained")),
+            "{findings:#?}"
+        );
+        assert!(
+            !findings.iter().any(|finding| finding.message.contains("unavailable")),
+            "{findings:#?}"
+        );
+    }
+
+    #[test]
+    fn compiler_dataflow_uses_registry_package_parameter_contracts() {
+        use miden_package_registry::PackageCache;
+        let source =
+            project("use dep\npub proc entry() -> u32\nadv_push\nexec.dep::consume\nend\n");
+        let manifest = source.parent().unwrap().join("miden-project.toml");
+        let mut text = std::fs::read_to_string(&manifest).unwrap();
+        text.push_str("[dependencies]\ndep = \"1.0.0\"\n");
+        std::fs::write(manifest, text).unwrap();
+        let mut package = Assembler::default()
+            .assemble_library(
+                "dep",
+                "namespace dep\npub proc consume(value: u32) -> \
+                 u32\npush.1\nu32wrapping_add\nend\n",
+                core::iter::empty::<&str>(),
+            )
+            .unwrap();
+        package.version = "1.0.0".parse().unwrap();
+        let mut cache = InMemoryPackageRegistry::default();
+        cache.cache_package(Arc::from(package)).unwrap();
+        let findings = diagnostics(&source, &BTreeMap::new(), cache, None);
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.source.as_deref() == Some("miden-compiler")
+                    && finding.message.contains("unconstrained")
+                    && finding.range.start.line == 3),
+            "{findings:#?}"
+        );
+        assert!(
+            !findings.iter().any(|finding| finding.message.contains("unavailable")),
+            "{findings:#?}"
+        );
+    }
+
+    #[test]
+    fn successful_projects_preserve_semantic_warnings() {
+        let source = project(
+            "pub mod child\nuse {helper} from ::app::child\npub proc main\npush.1 drop\nend\n",
+        );
+        std::fs::write(
+            source.parent().unwrap().join("child.masm"),
+            "pub proc helper\npush.1 drop\nend\n",
+        )
+        .unwrap();
+        let findings =
+            diagnostics(&source, &BTreeMap::new(), InMemoryPackageRegistry::default(), None);
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.source.as_deref() == Some("miden-assembler")
+                    && finding.severity == Some(DiagnosticSeverity::WARNING)
+                    && finding.message.contains("unused")),
+            "{findings:#?}"
+        );
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.severity == Some(DiagnosticSeverity::ERROR)),
+            "{findings:#?}"
+        );
+    }
+
+    #[test]
+    fn unsupported_lifting_is_reported_instead_of_silently_skipped() {
+        let source = project("pub proc entry\ndynexec\nend\n");
+        let findings =
+            diagnostics(&source, &BTreeMap::new(), InMemoryPackageRegistry::default(), None);
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.source.as_deref() == Some("miden-compiler")
+                    && finding.severity == Some(DiagnosticSeverity::WARNING)
+                    && (finding.message.contains("skipped")
+                        || finding.message.contains("unavailable"))),
+            "{findings:#?}"
+        );
+    }
+
+    #[test]
+    fn diagnostics_do_not_assign_an_unrelated_targets_errors_to_the_open_document() {
+        let source = project("pub proc main\npush.1 drop\nend\n");
+        let root = source.parent().unwrap();
+        let manifest = root.join("miden-project.toml");
+        let mut text = std::fs::read_to_string(&manifest).unwrap();
+        text.push_str(
+            "[[bin]]\nname = \"other\"\npath = \"other.masm\"\nnamespace = \"app::other\"\n",
+        );
+        std::fs::write(manifest, text).unwrap();
+        std::fs::write(root.join("other.masm"), "begin\nexec.missing\nend\n").unwrap();
+        let findings =
+            diagnostics(&source, &BTreeMap::new(), InMemoryPackageRegistry::default(), None);
+        assert!(findings.is_empty(), "{findings:#?}");
     }
 
     #[test]

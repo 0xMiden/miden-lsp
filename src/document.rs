@@ -1,12 +1,10 @@
-use std::ops::Range as StdRange;
-
-use std::sync::Arc;
-use tower_lsp::lsp_types::{
-    Diagnostic, DiagnosticSeverity, Position, Range, TextDocumentContentChangeEvent, Url,
-};
+use std::{ops::Range as StdRange, sync::Arc};
 
 use miden_assembly_syntax::debuginfo::{DefaultSourceManager, SourceLanguage, SourceManager, Uri};
 use miden_assembly_syntax_cst::{Parse, parse_source_file};
+use tower_lsp::lsp_types::{
+    Diagnostic, DiagnosticSeverity, Position, Range, TextDocumentContentChangeEvent, Url,
+};
 
 #[derive(Debug)]
 pub struct TextDocument {
