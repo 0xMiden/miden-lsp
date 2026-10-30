@@ -17,9 +17,58 @@ struct ToolchainFile {
 #[derive(Deserialize)]
 struct Channel {
     channel: String,
+    name: Option<String>,
+}
+
+pub(crate) struct LaunchToolchain {
+    declaration: Option<(PathBuf, String)>,
+    sysroot: Option<PathBuf>,
+    home: Option<PathBuf>,
+    forced: Option<String>,
+}
+
+impl Default for LaunchToolchain {
+    fn default() -> Self {
+        Self {
+            declaration: std::env::current_dir()
+                .ok()
+                .and_then(|directory| project_toolchain(&directory).ok().flatten()),
+            sysroot: std::env::var_os("MIDEN_SYSROOT")
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from),
+            home: std::env::var_os("MIDENUP_HOME").map(PathBuf::from),
+            forced: std::env::var("MIDEN_LSP_TOOLCHAIN_OVERRIDE")
+                .ok()
+                .filter(|value| !value.is_empty()),
+        }
+    }
+}
+
+impl LaunchToolchain {
+    fn inherited_sysroot(
+        &self,
+        declaration: Option<&(PathBuf, String)>,
+        configured_home: Option<&PathBuf>,
+    ) -> Option<&Path> {
+        if configured_home.is_some_and(|home| Some(home) != self.home.as_ref()) {
+            return None;
+        }
+        if self.forced.is_some()
+            || declaration.is_none()
+            || declaration == self.declaration.as_ref()
+        {
+            self.sysroot.as_deref()
+        } else {
+            None
+        }
+    }
 }
 
 pub fn project_channel(project: &Path) -> Result<Option<String>, String> {
+    Ok(project_toolchain(project)?.map(|(_, selector)| selector))
+}
+
+fn project_toolchain(project: &Path) -> Result<Option<(PathBuf, String)>, String> {
     let directory = if project.is_dir() {
         project
     } else {
@@ -35,16 +84,22 @@ pub fn project_channel(project: &Path) -> Result<Option<String>, String> {
         let file: ToolchainFile = toml::from_str(&text)
             .map_err(|error| format!("invalid '{}': {error}", path.display()))?;
         validate_channel(&file.toolchain.channel)?;
-        return Ok(Some(file.toolchain.channel));
+        let selector = match file.toolchain.name {
+            Some(name) => format!("custom:{name}"),
+            None => file.toolchain.channel,
+        };
+        validate_channel(&selector)?;
+        return Ok(Some((crate::analysis::normalize_path(&path), selector)));
     }
     Ok(None)
 }
 
 fn validate_channel(channel: &str) -> Result<(), String> {
-    if channel.is_empty()
-        || channel == "."
-        || channel == ".."
-        || !channel
+    let name = channel.strip_prefix("custom:").unwrap_or(channel);
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || !name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
     {
@@ -89,17 +144,17 @@ pub(crate) fn registry_for_document(
     if options.sysroot.is_some() {
         return default.select(options);
     }
-    let channel = std::env::var("MIDEN_LSP_TOOLCHAIN_OVERRIDE")
-        .ok()
-        .map(Some)
-        .map(Ok)
-        .unwrap_or_else(|| project_channel(document))?;
+    let declaration = project_toolchain(document)?;
+    let launch = &default.launch_toolchain;
+    if let Some(sysroot) =
+        launch.inherited_sysroot(declaration.as_ref(), options.midenup_home.as_ref())
+    {
+        let mut selected = options.clone();
+        selected.sysroot = Some(sysroot.into());
+        return default.select(&selected);
+    }
+    let channel = launch.forced.clone().or_else(|| declaration.map(|(_, selector)| selector));
     let Some(channel) = channel else {
-        if let Some(sysroot) = std::env::var_os("MIDEN_SYSROOT").filter(|path| !path.is_empty()) {
-            let mut selected = options.clone();
-            selected.sysroot = Some(sysroot.into());
-            return default.select(&selected);
-        }
         return default.select(options);
     };
     let home = match options
@@ -110,7 +165,11 @@ pub(crate) fn registry_for_document(
         Some(home) => home,
         None => query_home(document)?,
     };
-    let sysroot = home.join("toolchains").join(&channel);
+    validate_channel(&channel)?;
+    let sysroot = match channel.strip_prefix("custom:") {
+        Some(name) => home.join("toolchains/custom").join(name),
+        None => home.join("toolchains").join(&channel),
+    };
     if !sysroot.is_dir() {
         return Err(format!(
             "Miden toolchain '{channel}' is not installed. Run `midenup install {channel}` and \
@@ -266,6 +325,64 @@ mod tests {
             assert!(package.manifest.exports().any(|export| export.name() == name));
         }
         assert!(default.registry().packages().is_empty());
+    }
+
+    #[test]
+    fn named_toolchains_use_the_custom_installation_not_the_base_channel() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let home = root.path().join("midenup");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(home.join("toolchains/custom/project-dev/lib")).unwrap();
+        std::fs::write(
+            project.join("miden-toolchain.toml"),
+            "[toolchain]\nname = 'project-dev'\nchannel = '0.18.0'\n",
+        )
+        .unwrap();
+        assert_eq!(project_channel(&project).unwrap().as_deref(), Some("custom:project-dev"));
+        let options = InitializationOptions {
+            midenup_home: Some(home.clone()),
+            ..Default::default()
+        };
+        assert!(
+            registry_for_document(&options, &Arc::new(RegistryState::default()), &project).is_ok()
+        );
+        assert!(!home.join("toolchains/0.18.0").exists());
+        std::fs::write(
+            project.join("miden-toolchain.toml"),
+            "[toolchain]\nchannel = 'custom:project-dev'\n",
+        )
+        .unwrap();
+        assert!(
+            registry_for_document(&options, &Arc::new(RegistryState::default()), &project).is_ok()
+        );
+        for selector in ["custom:", "custom:..", "custom:../dev", "custom:dev/other"] {
+            assert!(validate_channel(selector).is_err());
+        }
+    }
+
+    #[test]
+    fn inherited_sysroots_follow_launch_identity_without_hiding_toolchain_file_edits() {
+        let declaration = (PathBuf::from("/workspace/miden-toolchain.toml"), "0.18.0".into());
+        let launch = LaunchToolchain {
+            declaration: Some(declaration.clone()),
+            sysroot: Some("/midenup/toolchains/0.19.0".into()),
+            home: Some("/midenup".into()),
+            forced: None,
+        };
+        assert_eq!(
+            launch.inherited_sysroot(Some(&declaration), None),
+            Some(Path::new("/midenup/toolchains/0.19.0"))
+        );
+        let changed = (declaration.0.clone(), "0.20.0".into());
+        assert!(launch.inherited_sysroot(Some(&changed), None).is_none());
+        let other = (PathBuf::from("/other/miden-toolchain.toml"), declaration.1.clone());
+        assert!(launch.inherited_sysroot(Some(&other), None).is_none());
+        assert!(
+            launch
+                .inherited_sysroot(Some(&declaration), Some(&PathBuf::from("/other-home")))
+                .is_none()
+        );
     }
 
     #[test]

@@ -22,7 +22,7 @@ exports.run = async function () {
     assert.ok(extension, 'the real development extension must be loaded');
     await extension.activate();
     const source = vscode.Uri.file(path.join(root, 'project', 'mod.masm'));
-    const child = vscode.Uri.file(path.join(root, 'project', 'child.masm'));
+    const gitDependency = fs.existsSync(path.join(root, 'dependency', 'miden-project.toml'));
     const document = await vscode.workspace.openTextDocument(source);
     const editor = await vscode.window.showTextDocument(document);
     await waitFor('compiler warning', () => vscode.languages.getDiagnostics(source).some(
@@ -32,7 +32,10 @@ exports.run = async function () {
     results.push('real midenup cold-installs and launches the actual LSP in VS Code');
 
     const definitions = await vscode.commands.executeCommand('vscode.executeDefinitionProvider', source, new vscode.Position(7, 14));
-    assert.ok(definitions.some(item => (item.uri || item.targetUri).fsPath === child.fsPath));
+    assert.ok(definitions.length > 0);
+    const child = definitions[0].uri || definitions[0].targetUri;
+    if (gitDependency) assert.ok(child.fsPath.startsWith(path.join(root, 'git-cache')));
+    else assert.equal(child.fsPath, path.join(root, 'project', 'child.masm'));
     const hovers = await vscode.commands.executeCommand('vscode.executeHoverProvider', source, new vscode.Position(7, 14));
     assert.ok(hovers.some(item => item.contents.length > 0));
     const symbols = await vscode.commands.executeCommand('vscode.executeDocumentSymbolProvider', source);
@@ -48,6 +51,7 @@ exports.run = async function () {
     const original = fs.readFileSync(child.fsPath, 'utf8');
     fs.writeFileSync(child.fsPath, original.replace('target', 'other'));
     await waitFor('disk dependency change', () => vscode.languages.getDiagnostics(source).some(item => item.message.includes('target')));
+    assert.equal(fs.readFileSync(child.fsPath, 'utf8'), original.replace('target', 'other'));
     fs.writeFileSync(child.fsPath, original);
     await waitFor('restored dependency', () => vscode.languages.getDiagnostics(source).length === 0);
     results.push('real VS Code file watchers revalidate open callers');
@@ -60,6 +64,20 @@ exports.run = async function () {
     assert.ok(await childEditor.edit(builder => builder.replace(new vscode.Range(0, 9, 0, 14), 'target')));
     await waitFor('unsaved dependency restored', () => vscode.languages.getDiagnostics(source).length === 0);
     results.push('unsaved dependency overlays refresh the caller');
+
+    if (gitDependency) {
+      const edits = new vscode.WorkspaceEdit();
+      edits.replace(child, new vscode.Range(0, 9, 0, 15), 'renamed');
+      edits.replace(source, new vscode.Range(8, 10, 8, 16), 'renamed');
+      assert.ok(await vscode.workspace.applyEdit(edits));
+      await waitFor('matching unsaved Git dependency rename', () => vscode.languages.getDiagnostics(source).length === 0);
+      assert.equal(fs.readFileSync(child.fsPath, 'utf8'), original);
+      fs.renameSync(path.join(root, 'dependency'), path.join(root, 'dependency-offline'));
+      const localHover = await vscode.commands.executeCommand('vscode.executeHoverProvider', source, new vscode.Position(7, 10));
+      assert.ok(localHover.length > 0);
+      assert.ok(!fs.existsSync(path.join(root, 'midenup', 'git', 'checkouts')));
+      results.push('Git navigation and assembly share overlays and keep working offline');
+    }
 
     await vscode.commands.executeCommand('miden-lsp.restartServer');
     const restarted = await vscode.commands.executeCommand('vscode.executeDefinitionProvider', source, new vscode.Position(8, 14));

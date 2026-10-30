@@ -27,7 +27,8 @@ impl Server {
         command
             .env_remove("MIDEN_SYSROOT")
             .env_remove("MIDENUP_HOME")
-            .env_remove("MIDENUP_TOOLCHAIN");
+            .env_remove("MIDENUP_TOOLCHAIN")
+            .env_remove("MIDEN_LSP_TOOLCHAIN_OVERRIDE");
         Self::spawn_configured(command)
     }
 
@@ -235,6 +236,103 @@ fn editing_an_unsaved_dependency_refreshes_diagnostics_in_its_open_caller() {
     server.finish();
 }
 
+fn git_project(root: &Path) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    let repository = root.join("dependency");
+    std::fs::create_dir_all(&repository).unwrap();
+    std::fs::write(
+        repository.join("miden-project.toml"),
+        "[package]\nname = 'dep'\nversion = '1.0.0'\n[lib]\npath = 'mod.masm'\nnamespace = 'dep'\n",
+    )
+    .unwrap();
+    std::fs::write(repository.join("mod.masm"), "pub proc helper\npush.1 drop\nend\n").unwrap();
+    for arguments in [
+        vec!["init", "-b", "main"],
+        vec!["config", "user.name", "LSP test"],
+        vec!["config", "user.email", "test@example.invalid"],
+        vec!["config", "commit.gpgsign", "false"],
+        vec!["add", "."],
+        vec!["commit", "-m", "fixture"],
+    ] {
+        let output = Command::new("git").args(arguments).current_dir(&repository).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    }
+    let application = root.join("project");
+    project(&application, "use dep\npub proc main\nexec.dep::helper\nend\n");
+    let manifest = application.join("miden-project.toml");
+    let mut text = std::fs::read_to_string(&manifest).unwrap();
+    text.push_str(&format!(
+        "[dependencies]\ndep = {{ git = '{}', branch = 'main' }}\n",
+        Url::from_file_path(&repository).unwrap()
+    ));
+    std::fs::write(manifest, text).unwrap();
+    (application, repository, root.join("git-cache"))
+}
+
+fn git_server(project: &Path, root: &Path, cache: &Path) -> Server {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_miden-lsp"));
+    command
+        .args(["--no-toolchain-dispatch", "--project"])
+        .arg(project)
+        .env_remove("MIDEN_SYSROOT")
+        .env_remove("MIDENUP_TOOLCHAIN")
+        .env_remove("MIDEN_LSP_TOOLCHAIN_OVERRIDE")
+        .env("MIDENUP_HOME", root.join("home"));
+    let mut server = Server::spawn_configured(command);
+    server.initialize(&[project], json!({"gitCacheRoot":cache}));
+    server
+}
+
+#[test]
+fn git_dependency_overlays_use_the_same_checkout_for_navigation_and_assembly() {
+    let root = tempfile::tempdir().unwrap();
+    let (application, _, cache) = git_project(root.path());
+    let source = application.join("mod.masm");
+    let text = std::fs::read_to_string(&source).unwrap();
+    let mut server = git_server(&application, root.path(), &cache);
+    server.open(&source, &text);
+    assert!(server.diagnostics(&source, 1).as_array().unwrap().is_empty());
+    let target = server.request("textDocument/definition", json!({"textDocument":{"uri":Url::from_file_path(&source).unwrap()},"position":{"line":2,"character":12}}));
+    let target = Url::parse(target["uri"].as_str().unwrap()).unwrap().to_file_path().unwrap();
+    assert!(target.starts_with(cache.canonicalize().unwrap()));
+    let dependency_text = std::fs::read_to_string(&target).unwrap();
+    server.open(&target, &dependency_text);
+    server.diagnostics(&target, 1);
+    server.diagnostics(&source, 1);
+    server.notify("textDocument/didChange", json!({"textDocument":{"uri":Url::from_file_path(&target).unwrap(),"version":2},"contentChanges":[{"text":dependency_text.replace("helper","renamed")}]}));
+    server.notify("textDocument/didChange", json!({"textDocument":{"uri":Url::from_file_path(&source).unwrap(),"version":2},"contentChanges":[{"text":text.replace("helper","renamed")}]}));
+    let findings = server.diagnostics(&source, 2);
+    assert!(findings.as_array().unwrap().is_empty(), "{findings:#}");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), dependency_text);
+    assert!(!root.path().join("home/git/checkouts").exists());
+    server.finish();
+}
+
+#[test]
+fn cached_git_dependencies_work_offline_after_restart_without_resetting_local_edits() {
+    let root = tempfile::tempdir().unwrap();
+    let (application, repository, cache) = git_project(root.path());
+    let source = application.join("mod.masm");
+    let text = std::fs::read_to_string(&source).unwrap();
+    let mut server = git_server(&application, root.path(), &cache);
+    server.open(&source, &text);
+    assert!(server.diagnostics(&source, 1).as_array().unwrap().is_empty());
+    let target = server.request("textDocument/definition", json!({"textDocument":{"uri":Url::from_file_path(&source).unwrap()},"position":{"line":2,"character":12}}));
+    let target = Url::parse(target["uri"].as_str().unwrap()).unwrap().to_file_path().unwrap();
+    server.finish();
+    let modified = "# keep this local edit\npub proc helper\npush.1 drop\nend\n";
+    std::fs::write(&target, modified).unwrap();
+    std::fs::rename(&repository, root.path().join("unavailable-remote")).unwrap();
+    let mut server = git_server(&application, root.path(), &cache);
+    server.open(&source, &text);
+    let findings = server.diagnostics(&source, 1);
+    assert!(findings.as_array().unwrap().is_empty(), "{findings:#}");
+    let hover = server.request("textDocument/hover", json!({"textDocument":{"uri":Url::from_file_path(&source).unwrap()},"position":{"line":1,"character":10}}));
+    assert!(hover["contents"]["value"].as_str().unwrap().contains("::app::main"));
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), modified);
+    assert!(!root.path().join("home/git/checkouts").exists());
+    server.finish();
+}
+
 #[test]
 fn multi_root_workspace_resolves_packages_from_each_projects_toolchain() {
     use miden_core::serde::Serializable;
@@ -397,10 +495,34 @@ fn real_midenup_installs_and_dispatches_the_server_with_package_navigation() {
     symlink(&manager, bin.join("midenup")).unwrap();
     symlink(&manager, bin.join("miden")).unwrap();
     let home = root.path().join("midenup");
-    for (override_channel, expected_channel) in [(None, "0.18.0"), (Some("0.19.0"), "0.19.0")] {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_miden-lsp"));
-        if let Some(channel) = override_channel {
-            command.args(["--toolchain", channel]);
+    for mode in ["project", "override", "named", "external"] {
+        let name = if mode == "named" {
+            "name = 'project-dev'\n"
+        } else {
+            ""
+        };
+        std::fs::write(
+            application.join("miden-toolchain.toml"),
+            format!(
+                "[toolchain]\n{name}channel = '0.18.0'\ncomponents = ['miden-lsp', \
+                 'dep']\nprofile = 'minimal'\n"
+            ),
+        )
+        .unwrap();
+        let expected_channel = match mode {
+            "named" => "custom/project-dev",
+            "override" | "external" => "0.19.0",
+            _ => "0.18.0",
+        };
+        let mut command = if mode == "external" {
+            let mut command = Command::new(bin.join("miden"));
+            command.args(["+0.19.0", "miden-lsp"]);
+            command
+        } else {
+            Command::new(env!("CARGO_BIN_EXE_miden-lsp"))
+        };
+        if mode == "override" {
+            command.args(["--toolchain", "0.19.0"]);
         }
         command
             .arg("--project")
@@ -409,6 +531,7 @@ fn real_midenup_installs_and_dispatches_the_server_with_package_navigation() {
             .arg(bin.join("miden"))
             .env_remove("MIDEN_SYSROOT")
             .env_remove("MIDENUP_TOOLCHAIN")
+            .env_remove("MIDEN_LSP_TOOLCHAIN_OVERRIDE")
             .env("MIDENUP_HOME", &home)
             .env("CARGO_HOME", &cargo_home)
             .env("MIDENUP_MANIFEST_URI", Url::from_file_path(&upstream).unwrap().as_str());
@@ -442,13 +565,14 @@ fn real_midenup_installs_and_dispatches_the_server_with_package_navigation() {
 #[test]
 fn file_watch_registration_and_disk_changes_refresh_open_callers() {
     let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
     let caller = "pub mod child\npub proc main\nexec.child::target\nend\n";
     project(root.path(), caller);
     let source = root.path().join("mod.masm");
     let child = root.path().join("child.masm");
     std::fs::write(&child, "pub proc other\npush.1 drop\nend\n").unwrap();
     let mut server = Server::start(root.path());
-    server.request("initialize", json!({"capabilities":{"workspace":{"didChangeWatchedFiles":{"dynamicRegistration":true}}}, "rootUri":Url::from_directory_path(root.path()).unwrap()}));
+    server.request("initialize", json!({"capabilities":{"workspace":{"didChangeWatchedFiles":{"dynamicRegistration":true,"relativePatternSupport":true}}}, "rootUri":Url::from_directory_path(root.path()).unwrap(),"initializationOptions":{"gitCacheRoot":cache.path()}}));
     server.notify("initialized", json!({}));
     loop {
         let request = server.receive();
@@ -464,6 +588,11 @@ fn file_watch_registration_and_disk_changes_refresh_open_callers() {
                 .any(|watcher| watcher["globPattern"] == "**/miden-toolchain.toml")
         );
         assert!(watchers.iter().any(|watcher| watcher["globPattern"] == "**/*.masp"));
+        assert!(watchers.iter().any(|watcher| {
+            watcher["globPattern"]["baseUri"]
+                == Url::from_directory_path(cache.path()).unwrap().as_str()
+                && watcher["globPattern"]["pattern"] == "**/*.{masm,masp,toml}"
+        }));
         server.send(json!({"jsonrpc":"2.0", "id":request["id"], "result":null}));
         break;
     }

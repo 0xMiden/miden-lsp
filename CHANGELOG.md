@@ -22,6 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Honor named midenup installations and externally selected toolchain sysroots.
+- Share Git dependency checkouts and unsaved buffers across navigation and assembly;
+  reuse cached dependencies offline without fetching or resetting local edits.
 - Preserve midenup's project-specific component, profile, and patch settings when
   dispatching the language server.
 - Exit promptly after the LSP exit notification without waiting for stdin EOF.

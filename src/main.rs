@@ -85,7 +85,9 @@ fn main() {
         .project
         .unwrap_or_else(|| std::env::current_dir().expect("working directory is unavailable"));
     let project = project.canonicalize().unwrap_or(project);
-    if !options.no_toolchain_dispatch {
+    let managed = std::env::var_os("MIDENUP_TOOLCHAIN").is_some_and(|value| !value.is_empty())
+        && std::env::var_os("MIDEN_SYSROOT").is_some_and(|value| !value.is_empty());
+    if !options.no_toolchain_dispatch && (!managed || options.toolchain.is_some()) {
         let channel = options
             .toolchain
             .map(Some)

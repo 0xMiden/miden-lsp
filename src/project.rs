@@ -10,7 +10,7 @@ use miden_assembly_syntax::{
     ast::ModuleKind,
     debuginfo::{
         DefaultSourceManager, FileLineCol, Location, Selection, SourceContent, SourceFile,
-        SourceId, SourceLanguage, SourceManager, SourceManagerError, SourceSpan, Uri,
+        SourceId, SourceManager, SourceManagerError, SourceSpan, Uri,
     },
 };
 use miden_assembly_syntax_cst::ast::Item;
@@ -29,10 +29,7 @@ pub(crate) fn source_files(
     if root.extension().is_none_or(|extension| extension != "masm") {
         return Ok(Vec::new());
     }
-    let manager = Arc::new(OverlaySourceManager {
-        inner: DefaultSourceManager::default(),
-        overlays: overlays.clone(),
-    });
+    let manager = Arc::new(OverlaySourceManager::new(overlays.clone()));
     if let Ok((module, support)) = miden_assembly_syntax::parser::read_modules_from_root(
         root,
         Some(namespace.into()),
@@ -120,6 +117,7 @@ pub(crate) fn source_files(
 pub(crate) struct OverlaySourceManager {
     inner: DefaultSourceManager,
     overlays: BTreeMap<PathBuf, String>,
+    git_cache_root: PathBuf,
 }
 
 impl OverlaySourceManager {
@@ -127,17 +125,43 @@ impl OverlaySourceManager {
         Self {
             inner: DefaultSourceManager::default(),
             overlays,
+            git_cache_root: crate::dependencies::default_git_cache_root(),
         }
+    }
+
+    pub(crate) fn with_git_cache_root(mut self, root: Option<&Path>) -> Self {
+        if let Some(root) = root {
+            self.git_cache_root = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
+        }
+        self
     }
 }
 
 impl SourceManager for OverlaySourceManager {
     fn load_from_raw_parts(&self, uri: Uri, content: SourceContent) -> Arc<SourceFile> {
-        let content = uri
-            .to_path()
-            .and_then(|path| self.overlays.get(&normalize_path(&path)))
-            .map(|text| SourceContent::new(SourceLanguage::Masm, uri.clone(), text.clone()))
-            .unwrap_or(content);
+        let path = uri.to_path();
+        let text = path
+            .as_ref()
+            .and_then(|path| self.overlays.get(&normalize_path(path)))
+            .map(String::as_str)
+            .unwrap_or(content.as_str());
+        let replacement = if path
+            .as_ref()
+            .is_some_and(|path| path.file_name().is_some_and(|name| name == "miden-project.toml"))
+        {
+            crate::dependencies::cached_manifest(text, &self.git_cache_root)
+        } else {
+            None
+        };
+        let content = if replacement.is_some() || text != content.as_str() {
+            SourceContent::new(
+                content.language(),
+                uri.clone(),
+                replacement.as_deref().unwrap_or(text).to_owned(),
+            )
+        } else {
+            content
+        };
         self.inner.load_from_raw_parts(uri, content)
     }
 
@@ -193,10 +217,8 @@ pub(crate) fn diagnostics(
     let Ok(manifest) = find_manifest_path(document) else {
         return Vec::new();
     };
-    let manager = Arc::new(OverlaySourceManager {
-        inner: DefaultSourceManager::default(),
-        overlays: overlays.clone(),
-    });
+    let manager =
+        Arc::new(OverlaySourceManager::new(overlays.clone()).with_git_cache_root(git_cache_root));
     let project = match Project::load(&manifest, manager.as_ref()) {
         Ok(project) => project.package(),
         Err(_) => return Vec::new(),

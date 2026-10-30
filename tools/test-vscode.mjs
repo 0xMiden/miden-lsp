@@ -12,6 +12,8 @@ const { values } = parseArgs({
     midenup: { type: 'string' },
     lsp: { type: 'string' },
     extension: { type: 'string' },
+    'named-toolchain': { type: 'boolean', default: false },
+    'git-dependency': { type: 'boolean', default: false },
   },
 });
 for (const name of ['code', 'midenup', 'lsp', 'extension']) {
@@ -19,7 +21,8 @@ for (const name of ['code', 'midenup', 'lsp', 'extension']) {
   values[name] = fs.realpathSync(values[name]);
 }
 assert.ok(fs.existsSync(path.join(values.extension, 'out', 'extension.js')), 'compile the extension first');
-const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'miden-lsp-vscode-')));
+const temp = process.platform === 'darwin' ? '/tmp' : os.tmpdir();
+const root = fs.realpathSync(fs.mkdtempSync(path.join(temp, 'miden-lsp-vscode-')));
 const project = path.join(root, 'project');
 const cargoHome = path.join(root, 'cargo');
 const bin = path.join(cargoHome, 'bin');
@@ -45,12 +48,31 @@ fs.writeFileSync(manifest, JSON.stringify({
   }] }],
 }));
 fs.writeFileSync(path.join(project, 'miden-toolchain.toml'),
-  '[toolchain]\nchannel = "0.18.0"\ncomponents = ["miden-lsp"]\nprofile = "minimal"\n');
+  '[toolchain]\n' + (values['named-toolchain'] ? 'name = "editor-dev"\n' : '') +
+  'channel = "0.18.0"\ncomponents = ["miden-lsp"]\nprofile = "minimal"\n');
 fs.writeFileSync(path.join(project, 'miden-project.toml'),
   '[package]\nname = "app"\nversion = "1.0.0"\n[lib]\npath = "mod.masm"\nnamespace = "app"\n');
 fs.writeFileSync(path.join(project, 'mod.masm'),
   'pub mod child\npub proc entry() -> u32\nadv_push\npush.1\nu32wrapping_add\nend\npub proc main\nexec.child::target\nend\n');
 fs.writeFileSync(path.join(project, 'child.masm'), 'pub proc target()\npush.1 drop\nend\n');
+if (values['git-dependency']) {
+  const dependency = path.join(root, 'dependency');
+  fs.mkdirSync(dependency);
+  fs.writeFileSync(path.join(dependency, 'miden-project.toml'),
+    '[package]\nname = "dep"\nversion = "1.0.0"\n[lib]\npath = "mod.masm"\nnamespace = "dep"\n');
+  fs.writeFileSync(path.join(dependency, 'mod.masm'), 'pub proc target()\npush.1 drop\nend\n');
+  for (const args of [['init', '-b', 'main'], ['config', 'user.name', 'LSP editor test'],
+    ['config', 'user.email', 'test@example.invalid'], ['config', 'commit.gpgsign', 'false'],
+    ['add', '.'], ['commit', '-m', 'fixture']]) {
+    const result = spawnSync('git', args, { cwd: dependency, encoding: 'utf8' });
+    assert.ifError(result.error);
+    assert.equal(result.status, 0, result.stderr);
+  }
+  fs.appendFileSync(path.join(project, 'miden-project.toml'),
+    `[dependencies]\ndep = { git = '${pathToFileURL(dependency).href}', branch = 'main' }\n`);
+  fs.writeFileSync(path.join(project, 'mod.masm'),
+    'use dep\npub proc entry() -> u32\nadv_push\npush.1\nu32wrapping_add\nend\npub proc main\nexec.dep::target\nend\n');
+}
 fs.writeFileSync(path.join(project, '.vscode', 'settings.json'), JSON.stringify({
   'miden-lsp.binary.path': values.lsp,
   'miden-lsp.binary.args': ['--miden', path.join(bin, 'miden')],
@@ -62,9 +84,14 @@ fs.writeFileSync(path.join(project, '.vscode', 'settings.json'), JSON.stringify(
     RUST_MIN_STACK: '16777216',
   },
   'miden-lsp.trace.server': 'verbose',
+  'miden-lsp.initializationOptions': { gitCacheRoot: path.join(root, 'git-cache') },
 }));
 const log = fs.openSync(path.join(root, 'vscode.log'), 'w');
 console.log(`Editor test artifacts: ${root}`);
+const editorEnv = { ...process.env, MIDEN_LSP_EDITOR_TEST_ROOT: root };
+for (const name of ['MIDENUP_TOOLCHAIN', 'MIDEN_SYSROOT', 'MIDEN_LSP_TOOLCHAIN_OVERRIDE']) {
+  delete editorEnv[name];
+}
 const result = spawnSync(values.code, [
   `--extensionDevelopmentPath=${values.extension}`,
   `--extensionTestsPath=${fileURLToPath(new URL('../tests/editor.cjs', import.meta.url))}`,
@@ -73,7 +100,7 @@ const result = spawnSync(values.code, [
   '--disable-extensions', '--disable-workspace-trust', '--disable-updates',
   '--skip-welcome', '--skip-release-notes', project,
 ], {
-  env: { ...process.env, MIDEN_LSP_EDITOR_TEST_ROOT: root },
+  env: editorEnv,
   stdio: ['ignore', log, log],
   timeout: 180000,
 });

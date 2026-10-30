@@ -91,12 +91,15 @@ The server supports the following initialization options:
 
 - `registryArtifacts`: preassembled `.masp` artifacts to load into the in-memory
   registry used for registry-backed dependency resolution
-- `gitCacheRoot`: optional directory for cached git dependencies
+- `gitCacheRoot`: optional directory for cached git dependencies. Navigation and
+  assembly share these checkouts and unsaved buffers. Cached dependencies work
+  offline; editor requests do not fetch or reset them. Use the build tooling to
+  update a floating Git branch.
 - `midenupHome`: optional midenup installation directory; otherwise `MIDENUP_HOME`
   or `midenup show home` is used when a project declares a toolchain
 - `sysroot`: optional toolchain directory; packages in its `lib/` directory are
-  available to dependency resolution. Defaults to `MIDEN_SYSROOT` when launched
-  through midenup when no project-specific toolchain is declared. An explicit
+  available to dependency resolution. Uses the actual `MIDEN_SYSROOT` when launched
+  through midenup, including named toolchains and explicit channel overrides. An explicit
   initialization option takes precedence over project and environment settings.
 
 ### Toolchains
@@ -140,6 +143,8 @@ This uses a real VS Code Extension Host and midenup 1.3 or later, with
 isolated settings, toolchains, and a local manifest for the unpublished server.
 It checks cold installation, diagnostics, navigation, unsaved edits, file watching,
 restart, and shutdown without changing your normal editor or toolchain setup.
+Add `--named-toolchain --git-dependency` to exercise a named installation with
+cached Git dependency edits, offline navigation, and buffer recovery after restart.
 
 ### Compiler analysis and diagnostics
 

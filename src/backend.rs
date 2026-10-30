@@ -17,7 +17,7 @@ use tower_lsp::{
         GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams, InitializeParams,
         InitializeResult, InitializedParams, InlayHint, InlayHintOptions, InlayHintParams,
         InlayHintServerCapabilities, MessageType, OneOf, PrepareRenameResponse, ReferenceParams,
-        Registration, RenameOptions, RenameParams, SemanticTokensFullOptions,
+        Registration, RelativePattern, RenameOptions, RenameParams, SemanticTokensFullOptions,
         SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult, ServerCapabilities,
         TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
         WorkspaceEdit, WorkspaceFolder, WorkspaceSymbolParams,
@@ -41,6 +41,7 @@ struct ServerState {
     options: InitializationOptions,
     generation: u64,
     dynamic_file_watching: bool,
+    relative_file_watching: bool,
 }
 
 impl ServerState {
@@ -159,6 +160,7 @@ impl Backend {
     }
 
     async fn snapshot_for_path(&self, path: &Path) -> Option<ProjectSnapshot> {
+        let permit = self.analysis_gate.clone().acquire_owned().await.ok()?;
         let path = normalize_path(path);
         let (overlays, registry, git_cache_root, options) = {
             let state = self.state.read().await;
@@ -170,6 +172,7 @@ impl Backend {
             )
         };
         tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             let registry =
                 crate::toolchain::registry_for_document(&options, &registry, &path).ok()?;
             ProjectSnapshot::load_for_document(
@@ -203,6 +206,13 @@ impl LanguageServer for Backend {
             .and_then(|workspace| workspace.did_change_watched_files.as_ref())
             .and_then(|watching| watching.dynamic_registration)
             .unwrap_or(false);
+        let relative_file_watching = params
+            .capabilities
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.did_change_watched_files.as_ref())
+            .and_then(|watching| watching.relative_pattern_support)
+            .unwrap_or(false);
         let options = params
             .initialization_options
             .and_then(|value| serde_json::from_value::<InitializationOptions>(value).ok())
@@ -225,6 +235,7 @@ impl LanguageServer for Backend {
         state.registry = Arc::new(registry);
         state.workspace_folders = workspace_folders;
         state.dynamic_file_watching = dynamic_file_watching;
+        state.relative_file_watching = relative_file_watching;
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
@@ -274,22 +285,45 @@ impl LanguageServer for Backend {
 
     async fn initialized(&self, _: InitializedParams) {
         self.client.log_message(MessageType::INFO, "miden-lsp initialized").await;
-        let dynamic_file_watching = self.state.read().await.dynamic_file_watching;
+        let (dynamic_file_watching, relative_file_watching, git_cache_root) = {
+            let state = self.state.read().await;
+            (
+                state.dynamic_file_watching,
+                state.relative_file_watching,
+                state
+                    .git_cache_root
+                    .clone()
+                    .unwrap_or_else(crate::dependencies::default_git_cache_root),
+            )
+        };
         if dynamic_file_watching {
-            let options = DidChangeWatchedFilesRegistrationOptions {
-                watchers: [
-                    "**/*.masm",
-                    "**/*.masp",
-                    "**/miden-project.toml",
-                    "**/miden-toolchain.toml",
-                ]
-                .into_iter()
-                .map(|pattern| FileSystemWatcher {
-                    glob_pattern: GlobPattern::String(pattern.into()),
-                    kind: None,
-                })
-                .collect(),
-            };
+            let mut watchers =
+                ["**/*.masm", "**/*.masp", "**/miden-project.toml", "**/miden-toolchain.toml"]
+                    .into_iter()
+                    .map(|pattern| FileSystemWatcher {
+                        glob_pattern: GlobPattern::String(pattern.into()),
+                        kind: None,
+                    })
+                    .collect::<Vec<_>>();
+            if relative_file_watching {
+                match std::fs::create_dir_all(&git_cache_root)
+                    .and_then(|()| std::path::absolute(&git_cache_root))
+                {
+                    Ok(root) => {
+                        if let Ok(base_uri) = Url::from_directory_path(root) {
+                            watchers.push(FileSystemWatcher {
+                                glob_pattern: GlobPattern::Relative(RelativePattern {
+                                    base_uri: OneOf::Right(base_uri),
+                                    pattern: "**/*.{masm,masp,toml}".into(),
+                                }),
+                                kind: None,
+                            });
+                        }
+                    }
+                    Err(error) => tracing::warn!(%error, "cannot watch Git dependency cache"),
+                }
+            }
+            let options = DidChangeWatchedFilesRegistrationOptions { watchers };
             if let Err(error) = self
                 .client
                 .register_capability(vec![Registration {
@@ -533,6 +567,9 @@ impl LanguageServer for Backend {
         &self,
         params: WorkspaceSymbolParams,
     ) -> Result<Option<Vec<tower_lsp::lsp_types::SymbolInformation>>> {
+        let Ok(permit) = self.analysis_gate.clone().acquire_owned().await else {
+            return Ok(None);
+        };
         let (folders, overlays, registry, options, git_cache_root) = {
             let state = self.state.read().await;
             (
@@ -544,6 +581,7 @@ impl LanguageServer for Backend {
             )
         };
         let symbols = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             let mut symbols = Vec::new();
             for folder in folders {
                 let Ok(selected) =

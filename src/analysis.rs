@@ -8,7 +8,7 @@ use std::{
 use miden_assembly_syntax::{
     Path as MasmPath,
     ast::{Ident, ModuleKind, ProcedureName},
-    debuginfo::{DefaultSourceManager, SourceManagerExt},
+    debuginfo::SourceManagerExt,
 };
 use miden_assembly_syntax_cst::{
     Parse as CstParse, SyntaxKind, SyntaxNode, SyntaxToken,
@@ -72,6 +72,7 @@ pub struct InitializationOptions {
 
 #[derive(Default)]
 pub struct RegistryState {
+    pub(crate) launch_toolchain: crate::toolchain::LaunchToolchain,
     registry: InMemoryPackageRegistry,
     artifacts: BTreeMap<(PackageId, Version), PathBuf>,
     selections: std::sync::Mutex<BTreeMap<Option<PathBuf>, CachedRegistry>>,
@@ -1157,7 +1158,10 @@ impl RootAnalysis {
         git_cache_root: Option<&FsPath>,
     ) -> Result<Self, String> {
         let manifest_path = find_manifest_path(document_path)?;
-        let source_manager = Arc::new(DefaultSourceManager::default());
+        let source_manager = Arc::new(
+            crate::project::OverlaySourceManager::new(BTreeMap::new())
+                .with_git_cache_root(git_cache_root),
+        );
         let project = Project::load(&manifest_path, source_manager.as_ref())
             .map_err(|error| error.to_string())?;
         let package_manifest_path = project
@@ -1198,7 +1202,8 @@ impl RootAnalysis {
         let mut metadata_packages = Vec::new();
         let mut seen_metadata = BTreeSet::new();
 
-        let mut builder = ProjectDependencyGraphBuilder::new(registry.registry());
+        let mut builder = ProjectDependencyGraphBuilder::new(registry.registry())
+            .with_source_manager(source_manager.clone());
         if let Some(root) = git_cache_root {
             builder = builder.with_git_cache_root(root);
         }
@@ -1215,7 +1220,6 @@ impl RootAnalysis {
                         miden_project::ProjectSource::Virtual { .. } => continue,
                     };
 
-                    let source_manager = Arc::new(DefaultSourceManager::default());
                     let project = Project::load_project_reference(
                         node.name.as_ref(),
                         manifest_path,
@@ -1272,7 +1276,10 @@ impl RootAnalysis {
         git_cache_root: Option<&FsPath>,
     ) -> Result<Self, String> {
         let manifest_path = normalize_path(manifest_path);
-        let source_manager = Arc::new(DefaultSourceManager::default());
+        let source_manager = Arc::new(
+            crate::project::OverlaySourceManager::new(BTreeMap::new())
+                .with_git_cache_root(git_cache_root),
+        );
         let source_file = source_manager
             .load_file(&manifest_path)
             .map_err(|error| format!("failed to load '{}': {error}", manifest_path.display()))?;

@@ -67,9 +67,11 @@ fn analyze_into(
     git_cache_root: Option<&Path>,
     output: &mut Vec<Diagnostic>,
 ) -> Result<(), Report> {
-    let manager = Arc::new(OverlaySourceManager::new(overlays.clone()));
+    let manager =
+        Arc::new(OverlaySourceManager::new(overlays.clone()).with_git_cache_root(git_cache_root));
     let manifest = package.manifest_path().ok_or_else(|| Report::msg("project has no manifest"))?;
-    let mut builder = ProjectDependencyGraphBuilder::new(cache);
+    let mut builder =
+        ProjectDependencyGraphBuilder::new(cache).with_source_manager(manager.clone());
     if let Some(root) = git_cache_root {
         builder = builder.with_git_cache_root(root);
     }
