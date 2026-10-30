@@ -159,7 +159,6 @@ dependencies = ["install-rustfmt"]
 category = "Development"
 description = "Formats source code (Rust)"
 command = "cargo"
-toolchain = "nightly"
 args = ["fmt"]
 dependencies = ["install-rustfmt"]
 

@@ -7,16 +7,19 @@ use std::{
 
 use miden_assembly_syntax::{
     Path as MasmPath,
-    ast::{Ident, ProcedureName},
-    debuginfo::{DefaultSourceManager, SourceManagerExt},
+    ast::{Ident, ModuleKind, ProcedureName},
+    debuginfo::SourceManagerExt,
+};
+use miden_assembly_syntax_cst::{
+    Parse as CstParse, SyntaxKind, SyntaxNode, SyntaxToken,
+    ast::{self as cst, AstNode},
 };
 use miden_core::serde::Deserializable;
 use miden_mast_package::{
-    Package as MastPackage, PackageExport, ProcedureExport, SectionId,
-    debug_info::{DebugFunctionsSection, DebugSourcesSection},
+    Package as MastPackage, PackageExport, ProcedureExport, debug_info::PackageDebugInfo,
 };
 use miden_package_registry::{
-    InMemoryPackageRegistry, PackageId, PackageProvider, PackageStore, Version,
+    InMemoryPackageRegistry, PackageCache, PackageId, PackageProvider, Version,
 };
 use miden_project::{
     Package, Project, ProjectDependencyGraphBuilder, ProjectDependencyNodeProvenance, Target,
@@ -30,11 +33,10 @@ use tower_lsp::lsp_types::{
     SemanticTokenModifier, SemanticTokenType, SemanticTokens, SemanticTokensLegend,
     SemanticTokensResult, SymbolInformation, SymbolKind, TextEdit, Url, WorkspaceEdit,
 };
-use tree_sitter::{Node, Tree};
 
 use crate::{
     document::{
-        byte_range_to_lsp_range, compute_line_offsets, offset_to_position, parse_text,
+        byte_range_to_lsp_range, compute_line_offsets, offset_to_position, parse_document,
         position_to_offset,
     },
     stack_effect::{
@@ -64,58 +66,66 @@ pub fn normalize_path(path: &FsPath) -> PathBuf {
 pub struct InitializationOptions {
     pub registry_artifacts: Vec<PathBuf>,
     pub git_cache_root: Option<PathBuf>,
+    pub sysroot: Option<PathBuf>,
+    pub midenup_home: Option<PathBuf>,
 }
 
 #[derive(Default)]
 pub struct RegistryState {
+    pub(crate) launch_toolchain: crate::toolchain::LaunchToolchain,
     registry: InMemoryPackageRegistry,
     artifacts: BTreeMap<(PackageId, Version), PathBuf>,
+    selections: std::sync::Mutex<BTreeMap<Option<PathBuf>, CachedRegistry>>,
+}
+
+struct CachedRegistry {
+    files: Vec<(PathBuf, u64, std::time::SystemTime)>,
+    state: Arc<RegistryState>,
 }
 
 impl RegistryState {
     pub fn from_options(options: &InitializationOptions) -> Result<Self, String> {
         let mut state = Self::default();
-        if options.registry_artifacts.is_empty() {
+        let mut artifact_paths = options.registry_artifacts.clone();
+        if let Some(sysroot) = &options.sysroot {
+            let library_dir = sysroot.join("lib");
+            let entries = fs::read_dir(&library_dir).map_err(|error| {
+                format!("unable to read toolchain packages in '{}': {error}", library_dir.display())
+            })?;
+            for entry in entries {
+                let path = entry.map_err(|error| error.to_string())?.path();
+                if path.is_file() && path.extension().is_some_and(|extension| extension == "masp") {
+                    artifact_paths.push(path);
+                }
+            }
+        }
+        artifact_paths = artifact_paths
+            .iter()
+            .map(|path| normalize_path(path))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if artifact_paths.is_empty() {
             return Ok(state);
         }
 
-        let mut pending = Vec::new();
-        for artifact_path in &options.registry_artifacts {
-            let bytes = fs::read(artifact_path).map_err(|error| {
+        for artifact_path in artifact_paths {
+            let bytes = fs::read(&artifact_path).map_err(|error| {
                 format!("failed to read '{}': {error}", artifact_path.display())
             })?;
             let package = Arc::new(MastPackage::read_from_bytes(&bytes).map_err(|error| {
-                format!("failed to decode '{}': {error}", artifact_path.display())
+                format!(
+                    "failed to decode '{}': {error}. Use miden-lsp from the same midenup \
+                     toolchain as the package, or select a compatible sysroot",
+                    artifact_path.display()
+                )
             })?);
-            pending.push((artifact_path.clone(), package));
-        }
-
-        while !pending.is_empty() {
-            let mut remaining = Vec::new();
-            let mut published = 0usize;
-
-            for (artifact_path, package) in pending {
-                match state.registry.publish_package(package.clone()) {
-                    Ok(version) => {
-                        state.artifacts.insert((package.name.clone(), version), artifact_path);
-                        published += 1;
-                    }
-                    Err(_) => remaining.push((artifact_path, package)),
-                }
-            }
-
-            if published == 0 {
-                let stuck = remaining
-                    .into_iter()
-                    .map(|(path, package)| format!("{} ({})", path.display(), package.name))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err(format!(
-                    "failed to publish registry artifacts due to unresolved dependencies: {stuck}"
-                ));
-            }
-
-            pending = remaining;
+            let name = package.name.clone();
+            let version = state
+                .registry
+                .cache_package(package)
+                .map_err(|error| format!("cannot cache '{}': {error}", artifact_path.display()))?;
+            state.artifacts.insert((name, version), artifact_path);
         }
 
         Ok(state)
@@ -123,6 +133,74 @@ impl RegistryState {
 
     pub fn registry(&self) -> &InMemoryPackageRegistry {
         &self.registry
+    }
+
+    pub(crate) fn select(&self, options: &InitializationOptions) -> Result<Arc<Self>, String> {
+        let key = options.sysroot.as_deref().map(normalize_path);
+        let mut paths = options.registry_artifacts.clone();
+        if let Some(sysroot) = &options.sysroot {
+            for entry in fs::read_dir(sysroot.join("lib")).map_err(|error| {
+                format!("cannot read toolchain '{}': {error}", sysroot.display())
+            })? {
+                let path = entry.map_err(|error| error.to_string())?.path();
+                if path.is_file() && path.extension().is_some_and(|extension| extension == "masp") {
+                    paths.push(path);
+                }
+            }
+        }
+        paths.sort();
+        paths.dedup();
+        let files = paths
+            .into_iter()
+            .map(|path| {
+                let metadata = fs::metadata(&path).map_err(|error| error.to_string())?;
+                let modified = metadata.modified().map_err(|error| error.to_string())?;
+                Ok((path, metadata.len(), modified))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        if let Some(cached) = self
+            .selections
+            .lock()
+            .map_err(|_| "toolchain registry lock poisoned")?
+            .get(&key)
+            && cached.files == files
+        {
+            return Ok(cached.state.clone());
+        }
+        let state = Arc::new(Self::from_options(options)?);
+        let mut selections =
+            self.selections.lock().map_err(|_| "toolchain registry lock poisoned")?;
+        if !selections.contains_key(&key) && selections.len() >= 16 {
+            selections.pop_first();
+        }
+        selections.insert(
+            key,
+            CachedRegistry {
+                files,
+                state: state.clone(),
+            },
+        );
+        Ok(state)
+    }
+
+    pub(crate) fn invalidate_selections(&self) {
+        if let Ok(mut selections) = self.selections.lock() {
+            selections.clear();
+        }
+    }
+
+    pub(crate) fn assembly_cache(&self) -> Result<InMemoryPackageRegistry, String> {
+        let mut cache = InMemoryPackageRegistry::default();
+        for (name, versions) in self.registry.packages() {
+            for record in versions.values() {
+                let package = self
+                    .registry
+                    .load_package(name, record.version())
+                    .map_err(|error| error.to_string())?;
+                cache.cache_package(package).map_err(|error| error.to_string())?;
+            }
+        }
+        Ok(cache)
     }
 
     pub fn artifact_path(&self, package: &PackageId, version: &Version) -> Option<&PathBuf> {
@@ -209,7 +287,6 @@ impl Definition {
 #[derive(Clone, Debug)]
 enum AliasTarget {
     Path(String),
-    MastRoot,
 }
 
 #[derive(Clone, Debug)]
@@ -244,12 +321,13 @@ pub(crate) struct ResolvedOccurrence {
 pub(crate) struct ParsedFile {
     text: String,
     line_offsets: Vec<usize>,
-    tree: Tree,
+    tree: CstParse,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct ModuleAnalysis {
     context: ContextKey,
+    kind: ModuleKind,
     file_path: PathBuf,
     module_path: String,
     priority: usize,
@@ -1080,7 +1158,10 @@ impl RootAnalysis {
         git_cache_root: Option<&FsPath>,
     ) -> Result<Self, String> {
         let manifest_path = find_manifest_path(document_path)?;
-        let source_manager = Arc::new(DefaultSourceManager::default());
+        let source_manager = Arc::new(
+            crate::project::OverlaySourceManager::new(BTreeMap::new())
+                .with_git_cache_root(git_cache_root),
+        );
         let project = Project::load(&manifest_path, source_manager.as_ref())
             .map_err(|error| error.to_string())?;
         let package_manifest_path = project
@@ -1121,7 +1202,8 @@ impl RootAnalysis {
         let mut metadata_packages = Vec::new();
         let mut seen_metadata = BTreeSet::new();
 
-        let mut builder = ProjectDependencyGraphBuilder::new(registry.registry());
+        let mut builder = ProjectDependencyGraphBuilder::new(registry.registry())
+            .with_source_manager(source_manager.clone());
         if let Some(root) = git_cache_root {
             builder = builder.with_git_cache_root(root);
         }
@@ -1138,7 +1220,6 @@ impl RootAnalysis {
                         miden_project::ProjectSource::Virtual { .. } => continue,
                     };
 
-                    let source_manager = Arc::new(DefaultSourceManager::default());
                     let project = Project::load_project_reference(
                         node.name.as_ref(),
                         manifest_path,
@@ -1195,7 +1276,10 @@ impl RootAnalysis {
         git_cache_root: Option<&FsPath>,
     ) -> Result<Self, String> {
         let manifest_path = normalize_path(manifest_path);
-        let source_manager = Arc::new(DefaultSourceManager::default());
+        let source_manager = Arc::new(
+            crate::project::OverlaySourceManager::new(BTreeMap::new())
+                .with_git_cache_root(git_cache_root),
+        );
         let source_file = source_manager
             .load_file(&manifest_path)
             .map_err(|error| format!("failed to load '{}': {error}", manifest_path.display()))?;
@@ -1237,7 +1321,7 @@ impl RootAnalysis {
     }
 }
 
-fn find_manifest_path(path: &FsPath) -> Result<PathBuf, String> {
+pub(crate) fn find_manifest_path(path: &FsPath) -> Result<PathBuf, String> {
     let path = normalize_path(path);
     if path.file_name().is_some_and(|name| name == "miden-project.toml") {
         return Ok(path);
@@ -1287,14 +1371,15 @@ fn build_snapshot(
 
     for package in &root.source_packages {
         let contexts = target_contexts(package)?;
-        let file_counts = count_context_files(&contexts)?;
+        let file_counts = count_context_files(&contexts, overlays)?;
 
         for context in contexts {
-            for file_path in collect_target_files(&context)? {
-                let priority = primary_priority(&context.target, &file_path, &file_counts);
+            for (file_path, module_path) in collect_target_files(&context, overlays)? {
+                let priority = primary_priority(context.executable, &file_path, &file_counts);
                 let parsed = parse_file(&file_path, overlays)?;
                 snapshot.parsed_files.entry(file_path.clone()).or_insert_with(|| parsed.clone());
-                let module = analyze_source_module(&context, &file_path, priority, &parsed)?;
+                let module =
+                    analyze_source_module(&context, &file_path, module_path, priority, &parsed)?;
 
                 for definition in &module.definitions {
                     let index = snapshot.definitions.len();
@@ -1356,8 +1441,7 @@ fn build_stack_analysis_by_file(
                 module_path: module.module_path.clone(),
                 text: parsed.text.clone(),
                 line_offsets: parsed.line_offsets.clone(),
-                executable_root: module.context.executable
-                    && module.definitions.iter().any(|definition| definition.entrypoint),
+                kind: module.kind,
                 resolved_references: module
                     .resolved_occurrences
                     .iter()
@@ -1395,14 +1479,13 @@ fn build_stack_analysis_by_file(
 
 #[derive(Clone, Debug)]
 struct TargetContext {
+    kind: ModuleKind,
     package_name: String,
     target: String,
     executable: bool,
     editable: bool,
     namespace: Arc<MasmPath>,
     root_file: PathBuf,
-    root_dir: PathBuf,
-    sibling_exec_roots: BTreeSet<PathBuf>,
 }
 
 fn target_contexts(package: &SourcePackageInput) -> Result<Vec<TargetContext>, String> {
@@ -1413,36 +1496,24 @@ fn target_contexts(package: &SourcePackageInput) -> Result<Vec<TargetContext>, S
         .parent()
         .ok_or_else(|| format!("manifest '{}' has no parent", manifest_path.display()))?;
 
-    let exec_roots = package
-        .package
-        .executable_targets()
-        .iter()
-        .filter_map(|target| target.path.as_ref())
-        .map(|path| normalize_path(&manifest_dir.join(path.path())))
-        .collect::<BTreeSet<_>>();
-
     let mut contexts = Vec::new();
 
-    if let Some(target) = package.package.library_target()
-        && target.path.is_some()
-    {
+    if let Some(target) = package.package.library_target() {
         contexts.push(build_target_context(
             package.package.name().inner().to_string(),
             target.inner(),
             manifest_dir,
-            &exec_roots,
             matches!(package.mode, SourceMode::AllTargets),
         )?);
     }
 
     if matches!(package.mode, SourceMode::AllTargets) {
         for target in package.package.executable_targets() {
-            if target.path.is_some() {
+            if target.path.to_path().is_some() {
                 contexts.push(build_target_context(
                     package.package.name().inner().to_string(),
                     target.inner(),
                     manifest_dir,
-                    &exec_roots,
                     matches!(package.mode, SourceMode::AllTargets),
                 )?);
             }
@@ -1456,75 +1527,56 @@ fn build_target_context(
     package_name: String,
     target: &Target,
     manifest_dir: &FsPath,
-    exec_roots: &BTreeSet<PathBuf>,
     editable: bool,
 ) -> Result<TargetContext, String> {
     let root_path = target
         .path
-        .as_ref()
+        .to_path()
         .ok_or_else(|| format!("target '{}' has no source path", target.name.inner()))?;
-    let root_file = normalize_path(&manifest_dir.join(root_path.path()));
-    let root_dir = root_file
-        .parent()
-        .ok_or_else(|| format!("target root '{}' has no parent", root_file.display()))?
-        .to_path_buf();
-
-    let sibling_exec_roots = exec_roots
-        .iter()
-        .filter(|path| *path != &root_file && path.parent() == Some(root_dir.as_path()))
-        .cloned()
-        .collect();
+    let root_file = normalize_path(&manifest_dir.join(root_path));
 
     Ok(TargetContext {
+        kind: match target.ty {
+            miden_project::TargetType::Executable => ModuleKind::Executable,
+            miden_project::TargetType::Kernel => ModuleKind::Kernel,
+            _ => ModuleKind::Library,
+        },
         executable: target.is_executable(),
         editable,
         namespace: target.namespace.inner().clone(),
         package_name,
-        root_dir,
         root_file,
-        sibling_exec_roots,
         target: target.name.inner().to_string(),
     })
 }
 
-fn count_context_files(contexts: &[TargetContext]) -> Result<BTreeMap<PathBuf, usize>, String> {
+fn count_context_files(
+    contexts: &[TargetContext],
+    overlays: &OverlayMap,
+) -> Result<BTreeMap<PathBuf, usize>, String> {
     let mut counts = BTreeMap::new();
     for context in contexts {
-        for file_path in collect_target_files(context)? {
+        for (file_path, _) in collect_target_files(context, overlays)? {
             *counts.entry(file_path).or_default() += 1;
         }
     }
     Ok(counts)
 }
 
-fn primary_priority(context: &str, file_path: &FsPath, counts: &BTreeMap<PathBuf, usize>) -> usize {
+fn primary_priority(
+    executable: bool,
+    file_path: &FsPath,
+    counts: &BTreeMap<PathBuf, usize>,
+) -> usize {
     let shared = counts.get(file_path).copied().unwrap_or_default() > 1;
-    if !shared || context == "lib" { 0 } else { 1 }
+    if !shared || !executable { 0 } else { 1 }
 }
 
-fn collect_target_files(context: &TargetContext) -> Result<Vec<PathBuf>, String> {
-    let mut files = Vec::new();
-    collect_masm_files(&context.root_dir, &mut files)?;
-    files.sort();
-    files.retain(|path| !context.sibling_exec_roots.contains(path));
-    Ok(files)
-}
-
-fn collect_masm_files(dir: &FsPath, files: &mut Vec<PathBuf>) -> Result<(), String> {
-    let entries = fs::read_dir(dir)
-        .map_err(|error| format!("failed to read directory '{}': {error}", dir.display()))?;
-
-    for entry in entries {
-        let entry = entry.map_err(|error| error.to_string())?;
-        let path = entry.path();
-        if path.is_dir() {
-            collect_masm_files(&path, files)?;
-        } else if path.extension().is_some_and(|ext| ext == "masm") {
-            files.push(normalize_path(&path));
-        }
-    }
-
-    Ok(())
+fn collect_target_files(
+    context: &TargetContext,
+    overlays: &OverlayMap,
+) -> Result<Vec<(PathBuf, String)>, String> {
+    crate::project::source_files(&context.root_file, &context.namespace, context.kind, overlays)
 }
 
 fn parse_file(path: &FsPath, overlays: &OverlayMap) -> Result<ParsedFile, String> {
@@ -1533,7 +1585,9 @@ fn parse_file(path: &FsPath, overlays: &OverlayMap) -> Result<ParsedFile, String
         None => fs::read_to_string(path)
             .map_err(|error| format!("failed to read '{}': {error}", path.display()))?,
     };
-    let (tree, _) = parse_text(&text)?;
+    let uri = Url::from_file_path(path)
+        .map_err(|_| format!("invalid source path '{}'", path.display()))?;
+    let (tree, _) = parse_document(&uri, &text)?;
     let line_offsets = compute_line_offsets(&text);
     Ok(ParsedFile {
         line_offsets,
@@ -1545,11 +1599,16 @@ fn parse_file(path: &FsPath, overlays: &OverlayMap) -> Result<ParsedFile, String
 fn analyze_source_module(
     context: &TargetContext,
     file_path: &FsPath,
+    module_path: String,
     priority: usize,
     parsed: &ParsedFile,
 ) -> Result<ModuleAnalysis, String> {
-    let module_path = module_path_for_file(context, file_path)?;
     let mut module = ModuleAnalysis {
+        kind: if file_path == context.root_file {
+            context.kind
+        } else {
+            ModuleKind::Library
+        },
         context: ContextKey {
             package: context.package_name.clone(),
             target: context.target.clone(),
@@ -1591,35 +1650,119 @@ fn analyze_source_module(
     });
 
     let mut pending_docs = Vec::<String>::new();
-    let mut cursor = parsed.tree.root_node().walk();
-    for child in parsed.tree.root_node().named_children(&mut cursor) {
-        match child.kind() {
-            "doc_comment" => {
-                pending_docs.push(normalize_doc_comment(node_text(child, &parsed.text)?))
+    for child in parsed.tree.syntax().children() {
+        if child.kind() == SyntaxKind::Doc {
+            pending_docs.push(normalize_doc_comment(&child.text().to_string()));
+            continue;
+        }
+        let docs = take_docs(&mut pending_docs);
+        match cst::Item::cast(child) {
+            Some(cst::Item::Submodule(declaration)) => {
+                if let Some(name) = declaration.name_token() {
+                    module.imports.insert(
+                        name.text().trim_matches('"').to_string(),
+                        ImportAlias {
+                            target: AliasTarget::Path(format!(
+                                "{}::{}",
+                                module.module_path,
+                                name.text()
+                            )),
+                        },
+                    );
+                }
             }
-            "import" => {
-                parse_import(&mut module, child, parsed)?;
-                pending_docs.clear();
+            Some(cst::Item::Import(import)) => parse_import(&mut module, &import, parsed)?,
+            Some(cst::Item::Constant(constant)) => {
+                if let Some(name) = constant.name_token() {
+                    record_definition(
+                        &mut module,
+                        constant.syntax(),
+                        Some(name),
+                        None,
+                        ItemKind::Constant,
+                        constant.visibility().is_some_and(|visibility| !visibility.is_internal()),
+                        false,
+                        parsed,
+                        docs,
+                    );
+                    if let Some(expr) = constant.expr() {
+                        record_token_references(
+                            &mut module,
+                            expr.syntax(),
+                            parsed,
+                            ReferenceKind::Constant,
+                        );
+                    }
+                }
             }
-            "constant" => {
-                parse_constant(&mut module, child, parsed, take_docs(&mut pending_docs))?;
+            Some(cst::Item::TypeDecl(declaration)) => {
+                if let Some(name) = declaration.name_token() {
+                    record_definition(
+                        &mut module,
+                        declaration.syntax(),
+                        Some(name),
+                        None,
+                        ItemKind::Type,
+                        declaration
+                            .visibility()
+                            .is_some_and(|visibility| !visibility.is_internal()),
+                        false,
+                        parsed,
+                        docs,
+                    );
+                    if let Some(body) = declaration.body() {
+                        record_token_references(
+                            &mut module,
+                            body.syntax(),
+                            parsed,
+                            ReferenceKind::Type,
+                        );
+                    }
+                }
             }
-            "type_alias" | "enum_declaration" => {
-                parse_type_definition(
+            Some(cst::Item::Procedure(procedure)) => {
+                let signature =
+                    procedure.signature().map(|signature| signature.syntax().text().to_string());
+                record_definition(
                     &mut module,
-                    child,
+                    procedure.syntax(),
+                    procedure.name_token(),
+                    signature,
+                    ItemKind::Procedure,
+                    procedure.visibility().is_some_and(|visibility| !visibility.is_internal()),
+                    false,
                     parsed,
-                    take_docs(&mut pending_docs),
-                    child.kind() == "enum_declaration",
-                )?;
+                    docs,
+                );
+                if let Some(signature) = procedure.signature() {
+                    record_token_references(
+                        &mut module,
+                        signature.syntax(),
+                        parsed,
+                        ReferenceKind::Type,
+                    );
+                }
+                if let Some(body) = procedure.block() {
+                    record_body_references(&mut module, body.syntax(), parsed);
+                }
             }
-            "procedure" => {
-                parse_procedure(&mut module, child, parsed, take_docs(&mut pending_docs), false)?;
+            Some(cst::Item::BeginBlock(block)) => {
+                record_definition(
+                    &mut module,
+                    block.syntax(),
+                    None,
+                    None,
+                    ItemKind::Procedure,
+                    false,
+                    true,
+                    parsed,
+                    docs,
+                );
+                if let Some(body) = block.block() {
+                    record_body_references(&mut module, body.syntax(), parsed);
+                }
             }
-            "entrypoint" => {
-                parse_procedure(&mut module, child, parsed, take_docs(&mut pending_docs), true)?;
-            }
-            _ => pending_docs.clear(),
+            _ => (),
         }
     }
 
@@ -1647,214 +1790,128 @@ fn normalize_doc_comment(raw: &str) -> String {
 
 fn parse_import(
     module: &mut ModuleAnalysis,
-    node: Node<'_>,
+    import: &cst::Import,
     parsed: &ParsedFile,
 ) -> Result<(), String> {
-    let target = node
-        .child_by_field_name("target")
-        .ok_or_else(|| "import without a target".to_string())?;
-    let target_text = node_text(target, &parsed.text)?.trim().to_string();
-    let alias_name = if let Some(alias) = node.child_by_field_name("alias") {
-        let name = alias
-            .child_by_field_name("name")
-            .ok_or_else(|| "import alias without a name".to_string())?;
-        node_text(name, &parsed.text)?.to_string()
+    let Some(target) = import.module_path() else {
+        return Ok(());
+    };
+    let raw_path = target.syntax().text().to_string();
+    let Ok(canonical) = canonicalize_path_text(raw_path.trim()) else {
+        return Ok(());
+    };
+    if import.kind() == cst::ImportKind::Items {
+        for item in import.item_specs() {
+            let Some(name) = item.name_token() else {
+                continue;
+            };
+            let alias = item.alias_token().unwrap_or_else(|| name.clone());
+            module.imports.insert(
+                alias.text().to_string(),
+                ImportAlias {
+                    target: AliasTarget::Path(format!("{canonical}::{}", name.text())),
+                },
+            );
+            module.raw_occurrences.push(RawOccurrence {
+                kind: ReferenceKind::ImportTarget,
+                range: token_range(&name, parsed),
+                raw_path: format!("{canonical}::{}", name.text()),
+            });
+            if alias != name {
+                module.raw_occurrences.push(RawOccurrence {
+                    kind: ReferenceKind::ImportAlias,
+                    range: token_range(&alias, parsed),
+                    raw_path: alias.text().to_string(),
+                });
+            }
+        }
     } else {
-        target_text
-            .rsplit("::")
-            .next()
-            .unwrap_or(target_text.as_str())
-            .trim_matches('"')
-            .to_string()
-    };
-
-    let import_target = match target.kind() {
-        "mast_root" => AliasTarget::MastRoot,
-        _ => AliasTarget::Path(canonicalize_path_text(&target_text)?),
-    };
-    module.imports.insert(
-        alias_name.clone(),
-        ImportAlias {
-            target: import_target,
-        },
-    );
-
+        let name =
+            import.module_alias_token().map(|token| token.text().to_string()).or_else(|| {
+                target.segments().last().map(|token| token.text().trim_matches('"').to_string())
+            });
+        if let Some(name) = name {
+            module.imports.insert(
+                name.clone(),
+                ImportAlias {
+                    target: AliasTarget::Path(canonical),
+                },
+            );
+            if let Some(alias) = import.module_alias_token() {
+                module.raw_occurrences.push(RawOccurrence {
+                    kind: ReferenceKind::ImportAlias,
+                    range: token_range(&alias, parsed),
+                    raw_path: name,
+                });
+            }
+        }
+    }
     module.raw_occurrences.push(RawOccurrence {
         kind: ReferenceKind::ImportTarget,
-        range: node_range(target, parsed),
-        raw_path: target_text,
+        range: node_range(target.syntax(), parsed),
+        raw_path,
     });
-
-    if let Some(alias) = node.child_by_field_name("alias")
-        && let Some(name) = alias.child_by_field_name("name")
-    {
-        module.raw_occurrences.push(RawOccurrence {
-            kind: ReferenceKind::ImportAlias,
-            range: node_range(name, parsed),
-            raw_path: alias_name,
-        });
-    }
-
     Ok(())
 }
 
-fn parse_constant(
+#[allow(clippy::too_many_arguments)]
+fn record_definition(
     module: &mut ModuleAnalysis,
-    node: Node<'_>,
-    parsed: &ParsedFile,
-    docs: Option<String>,
-) -> Result<(), String> {
-    let name = node
-        .child_by_field_name("name")
-        .ok_or_else(|| "constant without a name".to_string())?;
-    let ident = node_text(name, &parsed.text)?.to_string();
-    let path = format!("{}::{}", module.module_path, ident);
-    module.local_names.insert(ident.clone(), path.clone());
-
-    let selection_range = node_range(name, parsed);
-    let full_range = node_range(node, parsed);
-    let hover = render_definition_block("const", &path, None, docs.as_deref());
-    let exported = node.child_by_field_name("visibility").is_some() && !module.context.executable;
-
-    module.definitions.push(Definition {
-        context: module.context.clone(),
-        hover,
-        kind: ItemKind::Constant,
-        signature: None,
-        stack_signature: None,
-        location: Some(DefinitionLocation::Source {
-            path: module.file_path.clone(),
-            selection_range,
-        }),
-        editable: module.editable,
-        exported,
-        entrypoint: false,
-        module_path: module.module_path.clone(),
-        name: ident.clone(),
-        path: path.clone(),
-        renamable: module.editable,
-        selection_range,
-        symbol_kind: SymbolKind::CONSTANT,
-        visible_outside_context: exported,
-    });
-
-    #[allow(deprecated)]
-    module.document_symbols.push(DocumentSymbol {
-        detail: None,
-        kind: SymbolKind::CONSTANT,
-        name: ident,
-        range: full_range,
-        selection_range,
-        children: None,
-        tags: None,
-        deprecated: None,
-    });
-
-    record_nested_references(module, node, parsed, false, false);
-    Ok(())
-}
-
-fn parse_type_definition(
-    module: &mut ModuleAnalysis,
-    node: Node<'_>,
-    parsed: &ParsedFile,
-    docs: Option<String>,
-    is_enum: bool,
-) -> Result<(), String> {
-    let name = node
-        .child_by_field_name("name")
-        .ok_or_else(|| "type definition without a name".to_string())?;
-    let ident = node_text(name, &parsed.text)?.to_string();
-    let path = format!("{}::{}", module.module_path, ident);
-    module.local_names.insert(ident.clone(), path.clone());
-
-    let selection_range = node_range(name, parsed);
-    let full_range = node_range(node, parsed);
-    let keyword = if is_enum { "enum" } else { "type" };
-    let hover = render_definition_block(keyword, &path, None, docs.as_deref());
-    let exported = node.child_by_field_name("visibility").is_some() && !module.context.executable;
-
-    module.definitions.push(Definition {
-        context: module.context.clone(),
-        hover,
-        kind: ItemKind::Type,
-        signature: None,
-        stack_signature: None,
-        location: Some(DefinitionLocation::Source {
-            path: module.file_path.clone(),
-            selection_range,
-        }),
-        editable: module.editable,
-        exported,
-        entrypoint: false,
-        module_path: module.module_path.clone(),
-        name: ident.clone(),
-        path: path.clone(),
-        renamable: module.editable,
-        selection_range,
-        symbol_kind: SymbolKind::CLASS,
-        visible_outside_context: exported,
-    });
-
-    #[allow(deprecated)]
-    module.document_symbols.push(DocumentSymbol {
-        children: None,
-        detail: None,
-        kind: SymbolKind::CLASS,
-        name: ident,
-        range: full_range,
-        selection_range,
-        tags: None,
-        deprecated: None,
-    });
-
-    record_nested_references(module, node, parsed, true, false);
-    Ok(())
-}
-
-fn parse_procedure(
-    module: &mut ModuleAnalysis,
-    node: Node<'_>,
-    parsed: &ParsedFile,
-    docs: Option<String>,
+    node: &SyntaxNode,
+    name: Option<SyntaxToken>,
+    signature: Option<String>,
+    kind: ItemKind,
+    visible: bool,
     entrypoint: bool,
-) -> Result<(), String> {
-    let (name_node, ident) = if entrypoint {
-        (None, ProcedureName::MAIN_PROC_NAME.to_string())
-    } else {
-        let name = node
-            .child_by_field_name("name")
-            .ok_or_else(|| "procedure without a name".to_string())?;
-        let ident = first_named_child(name).unwrap_or(name);
-        (Some(ident), node_text(ident, &parsed.text)?.to_string())
-    };
-
-    let path = format!("{}::{}", module.module_path, ident);
-    module.local_names.insert(ident.clone(), path.clone());
-
-    let signature = node
-        .child_by_field_name("signature")
-        .map(|signature| node_text(signature, &parsed.text).map(str::to_string))
-        .transpose()?;
-
-    let selection_range = match name_node {
-        Some(name_node) => node_range(name_node, parsed),
-        None => {
-            let start = node.start_byte();
-            let end = (start + "begin".len()).min(node.end_byte());
-            byte_range_to_lsp_range(&parsed.text, &parsed.line_offsets, start..end)
+    parsed: &ParsedFile,
+    docs: Option<String>,
+) {
+    let (ident, selection_range) = match name {
+        Some(name)
+            if matches!(
+                name.kind(),
+                SyntaxKind::Ident | SyntaxKind::QuotedIdent | SyntaxKind::SpecialIdent
+            ) =>
+        {
+            (name.text().to_string(), token_range(&name, parsed))
         }
+        Some(_) => return,
+        None if entrypoint => {
+            let token = node
+                .children_with_tokens()
+                .filter_map(|element| element.into_token())
+                .find(|token| token.text() == "begin");
+            let range = token
+                .map(|token| token_range(&token, parsed))
+                .unwrap_or_else(|| node_range(node, parsed));
+            (ProcedureName::MAIN_PROC_NAME.to_string(), range)
+        }
+        None => return,
     };
-    let full_range = node_range(node, parsed);
-    let hover = render_definition_block("proc", &path, signature.as_deref(), docs.as_deref());
-    let exported = !entrypoint
-        && node.child_by_field_name("visibility").is_some()
-        && !module.context.executable;
-
+    let path = format!("{}::{ident}", module.module_path);
+    let symbol_kind = match kind {
+        ItemKind::Constant => SymbolKind::CONSTANT,
+        ItemKind::Type => SymbolKind::CLASS,
+        _ => SymbolKind::FUNCTION,
+    };
+    let keyword = match kind {
+        ItemKind::Constant => "const",
+        ItemKind::Type
+            if cst::TypeDecl::cast(node.clone())
+                .and_then(|declaration| declaration.keyword_token())
+                .is_some_and(|keyword| keyword.text() == "enum") =>
+        {
+            "enum"
+        }
+        ItemKind::Type => "type",
+        _ => "proc",
+    };
+    let exported = visible && !module.context.executable && !entrypoint;
+    module.local_names.insert(ident.clone(), path.clone());
     module.definitions.push(Definition {
         context: module.context.clone(),
-        hover,
-        kind: ItemKind::Procedure,
+        hover: render_definition_block(keyword, &path, signature.as_deref(), docs.as_deref()),
+        kind,
         signature: signature.clone(),
         stack_signature: None,
         location: Some(DefinitionLocation::Source {
@@ -1866,104 +1923,139 @@ fn parse_procedure(
         entrypoint,
         module_path: module.module_path.clone(),
         name: ident.clone(),
-        path: path.clone(),
+        path,
         renamable: module.editable && !entrypoint,
         selection_range,
-        symbol_kind: SymbolKind::FUNCTION,
+        symbol_kind,
         visible_outside_context: exported,
     });
-
     #[allow(deprecated)]
     module.document_symbols.push(DocumentSymbol {
         children: None,
-        detail: signature.clone(),
-        kind: SymbolKind::FUNCTION,
+        detail: signature,
+        kind: symbol_kind,
         name: ident,
-        range: full_range,
+        range: node_range(node, parsed),
         selection_range,
         tags: None,
         deprecated: None,
     });
-
-    if let Some(signature) = node.child_by_field_name("signature") {
-        record_nested_references(module, signature, parsed, true, false);
-    }
-    if let Some(body) = node.child_by_field_name("body") {
-        record_body_references(module, body, parsed);
-    }
-    Ok(())
 }
 
-fn record_body_references(module: &mut ModuleAnalysis, node: Node<'_>, parsed: &ParsedFile) {
-    let mut stack = vec![node];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "invoke" {
-            if let Some(path) = node.child_by_field_name("path")
-                && let Ok(raw_path) = node_text(path, &parsed.text)
-            {
-                module.raw_occurrences.push(RawOccurrence {
-                    kind: ReferenceKind::Invoke,
-                    range: node_range(path, parsed),
-                    raw_path: raw_path.to_string(),
-                });
-            }
-            continue;
-        }
+fn significant_tokens(node: &SyntaxNode) -> Vec<SyntaxToken> {
+    node.descendants_with_tokens()
+        .filter_map(|element| element.into_token())
+        .filter(|token| !token.kind().is_trivia())
+        .collect()
+}
 
-        if matches!(node.kind(), "const_path" | "const_ident") {
-            if let Ok(raw_path) = node_text(node, &parsed.text) {
-                module.raw_occurrences.push(RawOccurrence {
-                    kind: ReferenceKind::Constant,
-                    range: node_range(node, parsed),
-                    raw_path: raw_path.to_string(),
-                });
-            }
-            continue;
+fn record_body_references(module: &mut ModuleAnalysis, body: &SyntaxNode, parsed: &ParsedFile) {
+    for repeated in body.descendants().filter(|node| node.kind() == SyntaxKind::RepeatOp) {
+        let tokens = repeated
+            .children_with_tokens()
+            .take_while(|element| element.kind() != SyntaxKind::Block)
+            .filter_map(|element| element.into_token())
+            .filter(|token| !token.kind().is_trivia())
+            .collect::<Vec<_>>();
+        if tokens.len() > 1 {
+            record_paths(module, &tokens[1..], parsed, ReferenceKind::Constant);
         }
-
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            stack.push(child);
+    }
+    for instruction in body.descendants().filter(|node| node.kind() == SyntaxKind::Instruction) {
+        let tokens = significant_tokens(&instruction);
+        let Some(opcode) = tokens.first() else {
+            continue;
+        };
+        if matches!(opcode.text(), "exec" | "call" | "syscall" | "procref") {
+            record_paths(module, &tokens[1..], parsed, ReferenceKind::Invoke);
+        } else {
+            record_paths(module, &tokens[1..], parsed, ReferenceKind::Constant);
         }
     }
 }
 
-fn record_nested_references(
+fn record_token_references(
     module: &mut ModuleAnalysis,
-    root: Node<'_>,
+    node: &SyntaxNode,
     parsed: &ParsedFile,
-    include_type_paths: bool,
-    include_const_paths: bool,
+    kind: ReferenceKind,
 ) {
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        match node.kind() {
-            "path" if include_type_paths => {
-                if let Ok(raw_path) = node_text(node, &parsed.text) {
-                    module.raw_occurrences.push(RawOccurrence {
-                        kind: ReferenceKind::Type,
-                        range: node_range(node, parsed),
-                        raw_path: raw_path.to_string(),
-                    });
-                }
-            }
-            "const_path" if include_const_paths || !include_type_paths => {
-                if let Ok(raw_path) = node_text(node, &parsed.text) {
-                    module.raw_occurrences.push(RawOccurrence {
-                        kind: ReferenceKind::Constant,
-                        range: node_range(node, parsed),
-                        raw_path: raw_path.to_string(),
-                    });
-                }
-            }
-            _ => (),
-        }
+    record_paths(module, &significant_tokens(node), parsed, kind);
+}
 
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            stack.push(child);
+fn record_paths(
+    module: &mut ModuleAnalysis,
+    tokens: &[SyntaxToken],
+    parsed: &ParsedFile,
+    kind: ReferenceKind,
+) {
+    let mut index = 0;
+    while index < tokens.len() {
+        if !matches!(
+            tokens[index].kind(),
+            SyntaxKind::Ident
+                | SyntaxKind::QuotedIdent
+                | SyntaxKind::SpecialIdent
+                | SyntaxKind::ColonColon
+        ) {
+            index += 1;
+            continue;
         }
+        let first = index;
+        index += 1;
+        while index < tokens.len()
+            && (tokens[index].kind() == SyntaxKind::ColonColon
+                || (tokens[index - 1].kind() == SyntaxKind::ColonColon
+                    && matches!(
+                        tokens[index].kind(),
+                        SyntaxKind::Ident | SyntaxKind::QuotedIdent | SyntaxKind::SpecialIdent
+                    )))
+        {
+            index += 1;
+        }
+        let raw_path = tokens[first..index].iter().map(|token| token.text()).collect::<String>();
+        if kind == ReferenceKind::Type
+            && (is_primitive_type(&raw_path)
+                || tokens.get(index).is_some_and(|token| token.kind() == SyntaxKind::Colon))
+        {
+            continue;
+        }
+        let bounds = usize::from(tokens[first].text_range().start())
+            ..usize::from(tokens[index - 1].text_range().end());
+        module.raw_occurrences.push(RawOccurrence {
+            kind: kind.clone(),
+            range: byte_range_to_lsp_range(&parsed.text, &parsed.line_offsets, bounds),
+            raw_path,
+        });
     }
+}
+
+fn is_primitive_type(name: &str) -> bool {
+    matches!(
+        name,
+        "felt"
+            | "word"
+            | "bool"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "f32"
+            | "f64"
+            | "ptr"
+            | "mut"
+            | "const"
+            | "byte"
+            | "element"
+            | "struct"
+            | "enum"
+    )
 }
 
 fn resolve_reference(
@@ -2048,7 +2140,7 @@ fn resolve_path_reference(
         return Some(expanded.join(rest).to_string());
     }
 
-    Some(path.to_absolute().to_string())
+    Some(path.to_absolute().ok()?.to_string())
 }
 
 fn resolve_import_target(
@@ -2064,7 +2156,7 @@ fn resolve_import_target(
             .get(ident.as_str())
             .and_then(|import| alias_target_to_path(import, imports))
     } else {
-        Some(path.to_absolute().to_string())
+        Some(path.to_absolute().ok()?.to_string())
     }
 }
 
@@ -2089,15 +2181,15 @@ fn alias_target_to_path_inner(
                 Some(path.to_string())
             } else if let Some(ident) = path.as_ident() {
                 if !visited.insert(ident.as_str().to_string()) {
-                    return Some(path.to_absolute().to_string());
+                    return Some(path.to_absolute().ok()?.to_string());
                 }
                 imports
                     .get(ident.as_str())
                     .and_then(|next| alias_target_to_path_inner(next, imports, visited))
-                    .or_else(|| Some(path.to_absolute().to_string()))
+                    .or_else(|| Some(path.to_absolute().ok()?.to_string()))
             } else if let Some((head, rest)) = path.split_first() {
                 if !visited.insert(head.to_string()) {
-                    return Some(path.to_absolute().to_string());
+                    return Some(path.to_absolute().ok()?.to_string());
                 }
                 if let Some(next) = imports.get(head)
                     && let Some(expanded) = alias_target_to_path_inner(next, imports, visited)
@@ -2105,13 +2197,12 @@ fn alias_target_to_path_inner(
                     let expanded = MasmPath::new(expanded.as_str());
                     Some(expanded.join(rest).to_string())
                 } else {
-                    Some(path.to_absolute().to_string())
+                    Some(path.to_absolute().ok()?.to_string())
                 }
             } else {
                 None
             }
         }
-        AliasTarget::MastRoot => None,
     }
 }
 
@@ -2126,8 +2217,34 @@ fn index_metadata_package(
         executable: input.package.is_program(),
     };
 
-    let debug_sources = read_debug_sources(&input.package);
-    let debug_functions = read_debug_functions(&input.package);
+    let debug_info = input.package.debug_info().map_err(|error| {
+        format!("invalid debug information in '{}': {error}", input.package.name)
+    })?;
+    let mut functions_by_source = BTreeMap::new();
+    let mut functions_by_digest = BTreeMap::new();
+    let mut functions_by_name = BTreeMap::<Arc<str>, Vec<usize>>::new();
+    if let Some(info) = debug_info.as_ref() {
+        for (index, function) in info.functions().iter().enumerate() {
+            if let Some(source) = function.source_node.into_option() {
+                functions_by_source.entry(source).or_insert_with(Vec::new).push(index);
+            }
+            functions_by_digest
+                .entry(function.mast_root)
+                .or_insert_with(Vec::new)
+                .push(index);
+            for name in [Some(function.name_idx), function.linkage_name_idx.into_option()]
+                .into_iter()
+                .flatten()
+            {
+                if let Some(name) = info.get_string(name) {
+                    let candidates = functions_by_name.entry(name).or_default();
+                    if candidates.last() != Some(&index) {
+                        candidates.push(index);
+                    }
+                }
+            }
+        }
+    }
     let mut module_locations = BTreeMap::<String, DefinitionLocation>::new();
 
     for export in input.package.manifest.exports() {
@@ -2146,7 +2263,17 @@ fn index_metadata_package(
 
         let location = match export {
             PackageExport::Procedure(procedure) => {
-                debug_location_for_procedure(procedure, &debug_sources, &debug_functions)
+                let function = procedure
+                    .source_node
+                    .and_then(|source| unique_function(functions_by_source.get(&source)))
+                    .or_else(|| unique_function(functions_by_name.get(procedure.path.as_str())))
+                    .or_else(|| {
+                        unique_function(
+                            functions_by_name.get(procedure.path.last().unwrap_or_default()),
+                        )
+                    })
+                    .or_else(|| unique_function(functions_by_digest.get(&procedure.digest)));
+                debug_location_for_procedure(procedure, debug_info.as_ref(), function)
                     .map(DefinitionLocation::from)
                     .or_else(|| {
                         input
@@ -2261,73 +2388,40 @@ impl From<SourceDebugLocation> for DefinitionLocation {
     }
 }
 
-fn read_debug_sources(package: &MastPackage) -> Option<DebugSourcesSection> {
-    let section = package.sections.iter().find(|section| section.id == SectionId::DEBUG_SOURCES)?;
-    DebugSourcesSection::read_from_bytes(section.data.as_ref()).ok()
-}
-
-fn read_debug_functions(package: &MastPackage) -> Option<DebugFunctionsSection> {
-    let section = package
-        .sections
-        .iter()
-        .find(|section| section.id == SectionId::DEBUG_FUNCTIONS)?;
-    DebugFunctionsSection::read_from_bytes(section.data.as_ref()).ok()
+fn unique_function(candidates: Option<&Vec<usize>>) -> Option<usize> {
+    let candidates = candidates?;
+    (candidates.len() == 1).then(|| candidates[0])
 }
 
 fn debug_location_for_procedure(
     export: &ProcedureExport,
-    debug_sources: &Option<DebugSourcesSection>,
-    debug_functions: &Option<DebugFunctionsSection>,
+    info: Option<&PackageDebugInfo>,
+    function_index: Option<usize>,
 ) -> Option<SourceDebugLocation> {
-    let debug_sources = debug_sources.as_ref()?;
-    let debug_functions = debug_functions.as_ref()?;
-
-    let function = debug_functions
-        .functions
-        .iter()
-        .find(|function| function.mast_root.is_some_and(|root| root == export.digest))?;
-    let file = debug_sources.get_file(function.file_idx)?;
-    let file_path = debug_sources.get_string(file.path_idx)?;
-
+    let info = info?;
+    let function = info.functions().get(function_index?)?;
+    if function.mast_root != export.digest {
+        return None;
+    }
+    let file = info.get_file(function.file_idx)?;
+    let path = info.get_string(file.path_idx)?;
+    let path = match Url::parse(&path) {
+        Ok(uri) => uri.to_file_path().ok()?,
+        Err(_) => {
+            let path = PathBuf::from(path.as_ref());
+            if !path.is_absolute() {
+                return None;
+            }
+            path
+        }
+    };
     Some(SourceDebugLocation {
-        path: PathBuf::from(file_path.as_ref()),
+        path,
         range: Range::new(
-            Position::new(
-                function.line.to_u32().saturating_sub(1),
-                function.column.to_u32().saturating_sub(1),
-            ),
-            Position::new(function.line.to_u32().saturating_sub(1), function.column.to_u32()),
+            Position::new(function.line.to_u32(), function.column.to_u32()),
+            Position::new(function.line.to_u32(), function.column.to_u32().saturating_add(1)),
         ),
     })
-}
-
-fn module_path_for_file(context: &TargetContext, file_path: &FsPath) -> Result<String, String> {
-    if file_path == context.root_file {
-        return Ok(context.namespace.as_str().to_string());
-    }
-
-    let relative = file_path.strip_prefix(&context.root_dir).map_err(|error| error.to_string())?;
-    let mut module_path = context.namespace.to_path_buf();
-    let mut components = relative.components().collect::<Vec<_>>();
-    if components.is_empty() {
-        return Ok(context.namespace.as_str().to_string());
-    }
-
-    let file_component = components.pop().unwrap();
-    for component in components {
-        let segment = component.as_os_str().to_string_lossy();
-        module_path = module_path.join(segment.as_ref());
-    }
-
-    let file_component = file_component.as_os_str().to_os_string();
-    let stem = FsPath::new(&file_component)
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .ok_or_else(|| format!("failed to derive module path for '{}'", file_path.display()))?;
-    if stem != "mod" {
-        module_path = module_path.join(stem);
-    }
-    Ok(module_path.as_str().to_string())
 }
 
 fn canonicalize_path_text(text: &str) -> Result<String, String> {
@@ -2342,18 +2436,22 @@ fn canonicalize_path_text(text: &str) -> Result<String, String> {
         })
 }
 
-fn node_text<'a>(node: Node<'_>, source: &'a str) -> Result<&'a str, String> {
-    node.utf8_text(source.as_bytes())
-        .map_err(|error| format!("invalid UTF-8 in syntax tree: {error}"))
+fn node_range(node: &SyntaxNode, parsed: &ParsedFile) -> Range {
+    let bounds = node.text_range();
+    byte_range_to_lsp_range(
+        &parsed.text,
+        &parsed.line_offsets,
+        usize::from(bounds.start())..usize::from(bounds.end()),
+    )
 }
 
-fn node_range(node: Node<'_>, parsed: &ParsedFile) -> Range {
-    byte_range_to_lsp_range(&parsed.text, &parsed.line_offsets, node.start_byte()..node.end_byte())
-}
-
-fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).next()
+fn token_range(token: &SyntaxToken, parsed: &ParsedFile) -> Range {
+    let bounds = token.text_range();
+    byte_range_to_lsp_range(
+        &parsed.text,
+        &parsed.line_offsets,
+        usize::from(bounds.start())..usize::from(bounds.end()),
+    )
 }
 
 fn contains_position(range: Range, position: Position) -> bool {
@@ -2662,102 +2760,64 @@ fn collect_syntax_semantic_tokens(
     parsed: &ParsedFile,
     tokens: &mut BTreeMap<(u32, u32, u32), (u8, AbsoluteSemanticToken)>,
 ) {
-    let mut stack = vec![parsed.tree.root_node()];
-    while let Some(node) = stack.pop() {
-        match node.kind() {
-            "comment" => {
-                push_semantic_token_range(
-                    parsed,
-                    tokens,
-                    node_range(node, parsed),
-                    TOKEN_TYPE_COMMENT,
-                    0,
-                    4,
-                );
-                continue;
+    for token in parsed
+        .tree
+        .syntax()
+        .descendants_with_tokens()
+        .filter_map(|element| element.into_token())
+    {
+        let (token_type, modifiers, priority) = match token.kind() {
+            SyntaxKind::Comment => (TOKEN_TYPE_COMMENT, 0, 4),
+            SyntaxKind::DocComment => (TOKEN_TYPE_COMMENT, TOKEN_MODIFIER_DOCUMENTATION, 4),
+            SyntaxKind::QuotedString | SyntaxKind::QuotedIdent => (TOKEN_TYPE_STRING, 0, 2),
+            SyntaxKind::Number => (TOKEN_TYPE_NUMBER, 0, 4),
+            SyntaxKind::Ident if is_primitive_type(token.text()) => (TOKEN_TYPE_TYPE, 0, 2),
+            SyntaxKind::Ident
+                if matches!(
+                    token.text(),
+                    "pub"
+                        | "proc"
+                        | "begin"
+                        | "end"
+                        | "if"
+                        | "else"
+                        | "while"
+                        | "repeat"
+                        | "use"
+                        | "from"
+                        | "as"
+                        | "namespace"
+                        | "type"
+                        | "const"
+                        | "enum"
+                        | "extern"
+                        | "mod"
+                ) =>
+            {
+                (TOKEN_TYPE_KEYWORD, 0, 2)
             }
-            "doc_comment" => {
-                push_semantic_token_range(
-                    parsed,
-                    tokens,
-                    node_range(node, parsed),
-                    TOKEN_TYPE_COMMENT,
-                    TOKEN_MODIFIER_DOCUMENTATION,
-                    4,
-                );
-                continue;
-            }
-            "string" | "quoted_ident" => {
-                push_semantic_token_range(
-                    parsed,
-                    tokens,
-                    node_range(node, parsed),
-                    TOKEN_TYPE_STRING,
-                    0,
-                    4,
-                );
-            }
-            "integer" | "decimal" | "hex" | "hex_word" | "binary" | "word" => {
-                push_semantic_token_range(
-                    parsed,
-                    tokens,
-                    node_range(node, parsed),
-                    TOKEN_TYPE_NUMBER,
-                    0,
-                    4,
-                );
-            }
-            "visibility" => {
-                push_semantic_token_range(
-                    parsed,
-                    tokens,
-                    node_range(node, parsed),
-                    TOKEN_TYPE_KEYWORD,
-                    0,
-                    4,
-                );
-            }
-            "primitive_type" | "int_type" | "address_space" => {
-                push_semantic_token_range(
-                    parsed,
-                    tokens,
-                    node_range(node, parsed),
-                    TOKEN_TYPE_TYPE,
-                    0,
-                    4,
-                );
-            }
-            "function_param" | "function_result" => {
-                if let Some(name) = node.child_by_field_name("name") {
-                    push_semantic_token_range(
-                        parsed,
-                        tokens,
-                        node_range(name, parsed),
-                        TOKEN_TYPE_PARAMETER,
-                        TOKEN_MODIFIER_DECLARATION,
-                        3,
-                    );
+            SyntaxKind::Ident
+                if token.next_token().is_some_and(|next| next.kind() == SyntaxKind::Colon) =>
+            {
+                let parent = token.parent().map(|parent| parent.kind());
+                if parent == Some(SyntaxKind::Signature) {
+                    (TOKEN_TYPE_PARAMETER, TOKEN_MODIFIER_DECLARATION, 3)
+                } else if matches!(parent, Some(SyntaxKind::TypeBody | SyntaxKind::Attribute)) {
+                    (TOKEN_TYPE_PROPERTY, TOKEN_MODIFIER_DECLARATION, 3)
+                } else {
+                    continue;
                 }
             }
-            "struct_field" | "meta_key_value" => {
-                if let Some(name) = node.child_by_field_name("name") {
-                    push_semantic_token_range(
-                        parsed,
-                        tokens,
-                        node_range(name, parsed),
-                        TOKEN_TYPE_PROPERTY,
-                        TOKEN_MODIFIER_DECLARATION,
-                        3,
-                    );
-                }
-            }
-            _ => (),
-        }
-
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            stack.push(child);
-        }
+            _ => continue,
+        };
+        push_semantic_token_range(
+            parsed,
+            tokens,
+            token_range(&token, parsed),
+            token_type,
+            modifiers,
+            priority,
+        );
     }
 }
 
@@ -2896,24 +2956,10 @@ struct ResolutionIndex {
 mod tests {
     use std::{
         process::Command,
-        sync::Arc,
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use miden_assembly_syntax::{
-        Library,
-        ast::{Path as AstPath, PathBuf as AstPathBuf},
-        library::{LibraryExport, ProcedureExport as LibraryProcedureExport},
-    };
-    use miden_core::{
-        mast::{BasicBlockNodeBuilder, MastForest, MastForestContributor, MastNodeExt, MastNodeId},
-        operations::Operation,
-        serde::Serializable,
-    };
-    use miden_mast_package::{
-        Package as MastPackage, PackageExport, PackageManifest,
-        ProcedureExport as PackageProcedureExport, TargetType,
-    };
+    use miden_core::serde::Serializable;
     use tower_lsp::lsp_types::TextEdit;
 
     use super::*;
@@ -3027,52 +3073,22 @@ mod tests {
         );
     }
 
-    fn build_forest() -> (MastForest, MastNodeId) {
-        let mut forest = MastForest::new();
-        let node_id = BasicBlockNodeBuilder::new(vec![Operation::Add], Vec::new())
-            .add_to_forest(&mut forest)
-            .expect("failed to build basic block");
-        forest.make_root(node_id);
-        (forest, node_id)
-    }
-
-    fn absolute_export_path(name: &str) -> Arc<AstPath> {
-        let path = AstPathBuf::new(name).expect("invalid test path");
-        let path = path.as_path().to_absolute().into_owned();
-        Arc::from(path.into_boxed_path())
-    }
-
     fn build_package_bytes(name: &str, version: &str, export_path: &str) -> Vec<u8> {
-        let (forest, node_id) = build_forest();
-        let path = absolute_export_path(export_path);
-        let export = LibraryProcedureExport::new(node_id, Arc::clone(&path));
-
-        let mut exports = BTreeMap::new();
-        exports.insert(Arc::clone(&path), LibraryExport::Procedure(export));
-
-        let library = Arc::new(Library::new(Arc::new(forest), exports).unwrap());
-        let digest = library.mast_forest()[node_id].digest();
-        let manifest = PackageManifest::new([PackageExport::Procedure(PackageProcedureExport {
-            path,
-            digest,
-            signature: None,
-            attributes: Default::default(),
-        })])
-        .unwrap();
-
-        let package = MastPackage {
-            name: name.into(),
-            version: version.parse().unwrap(),
-            description: None,
-            kind: TargetType::Library,
-            mast: library,
-            manifest,
-            sections: Vec::new(),
-        };
-
-        let mut bytes = Vec::new();
-        package.write_into(&mut bytes);
-        bytes
+        let (namespace, procedure) = export_path.rsplit_once("::").unwrap();
+        let source = format!("namespace {namespace}\npub proc {procedure}\nadd\nend\n");
+        let mut package = miden_assembly::Assembler::default()
+            .assemble_library(name, source, core::iter::empty::<&str>())
+            .unwrap();
+        assert!(
+            package
+                .manifest
+                .exports()
+                .any(|export| export.path().as_str() == format!("::{export_path}")),
+            "{:?}",
+            package.manifest
+        );
+        package.version = version.parse().unwrap();
+        package.to_bytes()
     }
 
     #[test]
@@ -3103,6 +3119,174 @@ mod tests {
             HoverContents::Markup(content) => assert!(content.value.contains("proc ::app::foo")),
             _ => panic!("expected markdown hover"),
         }
+    }
+
+    #[test]
+    fn known_submodule_bodies_have_determinate_stack_effects() {
+        let root = temp_dir("submodule-stack-effects");
+        write_file(
+            &root.join("miden-project.toml"),
+            "[package]\nname = \"app\"\nversion = \"1.0.0\"\n[lib]\npath = \
+             \"mod.masm\"\nnamespace = \"app\"\n",
+        );
+        let source = root.join("mod.masm");
+        write_file(&source, "pub mod child\npub proc main\nexec.child::target\nend\n");
+        write_file(&root.join("child.masm"), "pub proc target\npush.1 drop\nend\n");
+        let snapshot = ProjectSnapshot::load_for_document(
+            &source,
+            &OverlayMap::default(),
+            &RegistryState::default(),
+            None,
+        )
+        .unwrap();
+        let diagnostics = snapshot.semantic_diagnostics(&source);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        assert_eq!(
+            snapshot
+                .definition_at(&source, Position::new(2, 12))
+                .unwrap()
+                .uri
+                .to_file_path()
+                .unwrap(),
+            root.join("child.masm").canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn recovers_symbols_after_an_incomplete_declaration() {
+        let root = temp_dir("incomplete-cst");
+        write_file(
+            &root.join("miden-project.toml"),
+            "[package]\nname = \"app\"\nversion = \"1.0.0\"\n[lib]\npath = \
+             \"mod.masm\"\nnamespace = \"app\"\n",
+        );
+        let source = root.join("mod.masm");
+        let text = "pub const = 1\npub proc kept\npush.1\nend\n";
+        write_file(&source, text);
+        let snapshot = ProjectSnapshot::load_for_document(
+            &source,
+            &OverlayMap::default(),
+            &RegistryState::default(),
+            None,
+        )
+        .unwrap();
+        let DocumentSymbolResponse::Nested(symbols) = snapshot.document_symbols(&source).unwrap()
+        else {
+            panic!("expected symbols")
+        };
+        assert!(symbols.iter().any(|symbol| symbol.name == "kept"));
+        assert!(!symbols.iter().any(|symbol| symbol.name == "="));
+        assert!(!crate::document::parse_text(text).unwrap().1.is_empty());
+    }
+
+    #[test]
+    fn indexes_braced_import_aliases_from_the_assembler_cst() {
+        let root = temp_dir("item-imports");
+        write_file(
+            &root.join("miden-project.toml"),
+            "[package]\nname = \"app\"\nversion = \"1.0.0\"\n[lib]\npath = \
+             \"mod.masm\"\nnamespace = \"app\"\n",
+        );
+        let source = root.join("mod.masm");
+        let text = "use {helper as renamed} from app::child\npub mod child\npub proc \
+                    main\nexec.renamed\nend\n";
+        write_file(&source, text);
+        write_file(&root.join("child.masm"), "pub proc helper\npush.1 drop\nend\n");
+        let snapshot = ProjectSnapshot::load_for_document(
+            &source,
+            &OverlayMap::default(),
+            &RegistryState::default(),
+            None,
+        )
+        .unwrap();
+        let definition = snapshot.definition_at(&source, position_after(text, "exec.")).unwrap();
+        assert_eq!(definition.uri.to_file_path().unwrap(), root.join("child.masm"));
+    }
+
+    #[test]
+    fn loads_toolchain_packages_from_a_configured_sysroot() {
+        let root = temp_dir("sysroot");
+        let lib = root.join("lib");
+        fs::create_dir_all(&lib).unwrap();
+        let artifact = lib.join("dep.masp");
+        fs::write(&artifact, build_package_bytes("dep", "1.0.0", "dep::helper")).unwrap();
+        let registry = RegistryState::from_options(&InitializationOptions {
+            registry_artifacts: vec![artifact.clone()],
+            sysroot: Some(root),
+            ..InitializationOptions::default()
+        })
+        .unwrap();
+        assert!(registry.registry.packages().contains_key(&PackageId::from("dep")));
+        assert_eq!(registry.artifacts.len(), 1);
+        assert!(
+            registry
+                .assembly_cache()
+                .unwrap()
+                .packages()
+                .contains_key(&PackageId::from("dep"))
+        );
+    }
+
+    #[test]
+    fn unreadable_packages_recommend_a_matching_toolchain() {
+        let root = temp_dir("incompatible-package");
+        let artifact = root.join("old.masp");
+        fs::write(&artifact, b"not a current package").unwrap();
+        let error = RegistryState::from_options(&InitializationOptions {
+            registry_artifacts: vec![artifact],
+            ..InitializationOptions::default()
+        })
+        .err()
+        .expect("invalid package must be rejected");
+        assert!(error.contains("same midenup toolchain"));
+    }
+
+    #[test]
+    fn package_debug_info_resolves_file_uris_and_zero_based_function_lines() {
+        let root = temp_dir("package-source");
+        let dependency_source = root.join("dependency with space.masm");
+        write_file(
+            &dependency_source,
+            "namespace dep\n#! documentation\npub proc helper\npush.1 drop\nend\npub proc \
+             other\npush.1 drop\nend\n",
+        );
+        let mut package = miden_assembly::Assembler::default()
+            .assemble_library("dep", dependency_source.as_path(), core::iter::empty::<&str>())
+            .unwrap();
+        let procedures = package
+            .manifest
+            .exports()
+            .filter_map(|export| match export {
+                PackageExport::Procedure(procedure) => Some(procedure),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(procedures.len(), 2);
+        assert_eq!(procedures[0].digest, procedures[1].digest);
+        assert_ne!(procedures[0].source_node, procedures[1].source_node);
+        package.version = "1.0.0".parse().unwrap();
+        let artifact = root.join("dep.masp");
+        fs::write(&artifact, package.to_bytes()).unwrap();
+        let app = root.join("app");
+        write_file(
+            &app.join("miden-project.toml"),
+            "[package]\nname = \"app\"\nversion = \"1.0.0\"\n[lib]\npath = \
+             \"mod.masm\"\nnamespace = \"app\"\n[dependencies]\ndep = { path = \"../dep.masp\" }\n",
+        );
+        let source = app.join("mod.masm");
+        let text = "use dep\npub proc main\nexec.dep::other\nend\n";
+        write_file(&source, text);
+        let snapshot = ProjectSnapshot::load_for_document(
+            &source,
+            &OverlayMap::default(),
+            &RegistryState::default(),
+            None,
+        )
+        .unwrap();
+        let definition =
+            snapshot.definition_at(&source, position_after(text, "exec.dep::")).unwrap();
+        assert_eq!(definition.uri, Url::from_file_path(dependency_source).unwrap());
+        assert_eq!(definition.range.start.line, 5);
     }
 
     #[test]
@@ -3380,7 +3564,8 @@ name = "cli"
 path = "asm/main.masm"
 "#,
         );
-        let lib_text = "use helpers\npub proc root\n    call.helpers::helper\nend\n";
+        let lib_text =
+            "pub mod helpers\nuse helpers\npub proc root\n    call.helpers::helper\nend\n";
         let helpers_text = "pub proc helper\n    push.1\nend\n";
         let main_text = "begin\n    call.pkg::core::helpers::helper\nend\n";
         write_file(&asm_dir.join("mod.masm"), lib_text);
@@ -3438,7 +3623,8 @@ path = "asm/main.masm"
              \"src/mod.masm\"\nnamespace = \"app::core\"\n",
         );
         let main_text = "\
-use app::core::helpers->math
+use app::core::helpers as math
+pub mod helpers
 const ERR = 1
 type Amount = felt
 pub proc main(value: Amount)
@@ -3647,6 +3833,8 @@ end
         let registry = RegistryState::from_options(&InitializationOptions {
             registry_artifacts: vec![artifact_path.clone()],
             git_cache_root: None,
+            sysroot: None,
+            midenup_home: None,
         })
         .unwrap();
 
